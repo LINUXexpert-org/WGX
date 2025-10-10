@@ -72,8 +72,8 @@ The installer also creates:
 ```bash
 # 1) Clone and run (as root)
 cd /root
-git clone https://github.com/<your-org>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/LINUXexpert-org/WG-Easy-Installer.git
+cd WG-Easy-Installer
 sudo bash install-wg-easy.sh
 
 # 2) Choose TUI or CLI, answer prompts (domain, email, ports, etc.)
