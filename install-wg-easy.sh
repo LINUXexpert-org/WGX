@@ -134,14 +134,19 @@ advance_bar(){ STEP_NUM=$((STEP_NUM+1)); local pct=$(( STEP_NUM * 100 / STEP_MAX
 
 run_step() {
   local title="$1"; shift
-  printf "\n\n%sStep %d/%d:%s %s\n" "$BLD" "$((STEP_NUM+1))" "$STEP_MAX" "$CLR" "$title" >&3
+  # Announce on the quiet console (FD 3)
+  printf "%s\n" "" >&3
+  printf "%s\n" "Step $((STEP_NUM+1))/$STEP_MAX: $title" >&3
+
+  # Write detailed log to the logfile via stderr (>&2)
   {
-    printf "\n--- [%s] %s ---\n" "$(date -Is)" "$title" >&2
+    printf "%s\n" "--- [$(date -Is)] $title ---" >&2
     bash -o pipefail -c "$@" >&2
-    printf "--- [%s] %s (OK) ---\n" "$(date -Is)" "$title" >&2
+    printf "%s\n" "--- [$(date -Is)] $title (OK) ---" >&2
   }
   advance_bar
 }
+
 
 # ===== Trap & Logging =====
 cleanup_on_error(){ printf "\n" >&3; err "An unexpected error occurred. See the log: $LOGFILE"; }
