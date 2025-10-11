@@ -20,14 +20,13 @@
 set -Eeuo pipefail
 
 # ===== Formatting / Helpers =====
-RED=$'\e[31m'; GRN=$'\e[32m'; BLU=$'\e[34m'; YLW=$'\e[33m'; BLD=$'\e[1m'; DIM=$'\e[2m'; CLR=$'\e[0m'
+RED=$'\e[31m'; GRN=$'\e[32m'; BLU=$'\e[34m'; YLW=$'\e[33m'; BLD=$'\e[1m'; CLR=$'\e[0m'
 err()  { printf "%s[ERROR]%s %s\n" "$RED" "$CLR" "$*" >&3; }
 ok()   { printf "%s[OK]%s    %s\n" "$GRN" "$CLR" "$*" >&3; }
 info() { printf "%s[INFO]%s  %s\n" "$BLU" "$CLR" "$*" >&3; }
 warn() { printf "%s[WARN]%s  %s\n" "$YLW" "$CLR" "$*" >&3; }
 
 require_root() { [[ $EUID -eq 0 ]] || { err "Please run as root (sudo)."; exit 1; }; }
-
 check_debian13() {
   if ! command -v lsb_release &>/dev/null; then apt-get update -y >/dev/null 2>&1 && apt-get install -y lsb-release >/dev/null 2>&1; fi
   local dist ver; dist=$(lsb_release -is 2>/dev/null || echo Debian); ver=$(lsb_release -rs 2>/dev/null || echo "13")
@@ -237,6 +236,10 @@ if [[ "${PURGE_CADDY:-Y}" =~ ^[Yy]$ ]]; then
   mkdir -p /etc/caddy/backup-\$TS
   cp -a /etc/caddy/* /etc/caddy/backup-\$TS/ 2>/dev/null || true
   find /etc/caddy -maxdepth 1 -type f ! -name 'Caddyfile' -print -exec mv {} /etc/caddy/backup-\$TS/ \\; || true
+  for d in conf.d sites-enabled snippets d vhosts; do
+    if [ -e \"/etc/caddy/\$d\" ]; then mv \"/etc/caddy/\$d\" \"/etc/caddy/backup-\$TS/\$d\"; fi
+  done
+  [ -f /etc/caddy/caddy.json ] && mv /etc/caddy/caddy.json \"/etc/caddy/backup-\$TS/caddy.json\"
   if [[ -s '$CADDYFILE' ]]; then
     awk 'BEGIN{skip=0}
       /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
@@ -255,9 +258,9 @@ STEP_MAX=$((STEP_MAX+1)) # 1 Update/base tools
 STEP_MAX=$((STEP_MAX+1)) # 2 sysctl forwarding
 STEP_MAX=$((STEP_MAX+1)) # 3 Docker Engine
 STEP_MAX=$((STEP_MAX+1)) # 4 docker compose plugin
-STEP_MAX=$((STEP_MAX+1)) # 5 Caddy
+STEP_MAX=$((STEP_MAX+1)) # 5 Caddy (+drop-in)
 STEP_MAX=$((STEP_MAX+1)) # 6 wg-easy files
-STEP_MAX=$((STEP_MAX+1)) # 7 Caddyfile
+STEP_MAX=$((STEP_MAX+1)) # 7 Caddyfile write/sanitize/validate
 if [[ "${ENABLE_UFW:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 if [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 if [[ "${ENABLE_F2B:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
@@ -283,7 +286,7 @@ run_step "Install & enable Docker Engine" "command -v docker >/dev/null || { cur
 run_step "Install docker compose plugin" "docker compose version >/dev/null 2>&1 || apt-get install $APTQ docker-compose-plugin"
 
 # 5) Caddy (enable autostart) + optional drop-in override
-run_step "Install & enable Caddy (+optional unit drop-in)" "
+run_step "Install & enable Caddy (+unit drop-in)" "
 if ! command -v caddy >/dev/null; then
   apt-get install $APTQ debian-keyring debian-archive-keyring
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -340,67 +343,38 @@ services:
 EOF
 "
 
-# 7) Caddyfile (no imports; no authentication providers)
+# 7) Caddyfile (write minimal, then inject basicauth if enabled), sanitize, validate
 CADDY_BASICAUTH_LINE=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
-  CADDY_BASICAUTH_LINE=$'    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }\n'
+  CADDY_BASICAUTH_LINE=$'  basicauth /* {\n    '"$BASIC_USER"' '"$BASIC_HASH"$'\n  }\n'
 fi
 
-if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
-  SITE_BODY=$(cat <<EOS
-  log {
-    output file $ACCESS_LOG_DIR/access.log
-    format json
-  }
-  header {
-    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-    X-Content-Type-Options "nosniff"
-    X-Frame-Options "SAMEORIGIN"
-    Referrer-Policy "no-referrer"
-    X-XSS-Protection "1; mode=block"
-  }
-
-  @allow_ips {
-    remote_ip $IP_ALLOW_CIDR
-  }
-
-  handle {
-    respond "Forbidden" 403
-  }
-
-  handle @allow_ips {
-$CADDY_BASICAUTH_LINE    reverse_proxy 127.0.0.1:$WG_EASY_PORT
-  }
-
-  tls {
-    protocols tls1.2 tls1.3
-  }
-EOS
-)
-else
-  SITE_BODY=$(cat <<EOS
-  log {
-    output file $ACCESS_LOG_DIR/access.log
-    format json
-  }
-  header {
-    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-    X-Content-Type-Options "nosniff"
-    X-Frame-Options "SAMEORIGIN"
-    Referrer-Policy "no-referrer"
-    X-XSS-Protection "1; mode=block"
-  }
-
+SITE_BODY=$(cat <<EOS
+encode gzip
+$(
+  if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
+    cat <<ALW
+@allow_ips {
+  remote_ip $IP_ALLOW_CIDR
+}
+handle {
+  respond "Forbidden" 403
+}
+handle @allow_ips {
 $CADDY_BASICAUTH_LINE  reverse_proxy 127.0.0.1:$WG_EASY_PORT
-
-  tls {
-    protocols tls1.2 tls1.3
-  }
+}
+ALW
+  else
+    printf "%s" "$CADDY_BASICAUTH_LINE  reverse_proxy 127.0.0.1:$WG_EASY_PORT"
+  fi
+)
+tls {
+  protocols tls1.2 tls1.3
+}
 EOS
 )
-fi
 
-run_step "Write Caddyfile with HTTP→HTTPS redirect & ACME" "
+run_step "Write Caddyfile with HTTP→HTTPS redirect & ACME; sanitize & validate" "
 cat > '$CADDYFILE' <<EOF
 {
   email $LE_EMAIL
@@ -412,20 +386,22 @@ http://$WG_DOMAIN {
 }
 
 $WG_DOMAIN {
-  encode gzip
+  log {
+    output file $ACCESS_LOG_DIR/access.log
+    format json
+}
 $SITE_BODY
 }
 EOF
-"
 
-# Sanitize any lingering auth/imports, validate & adapt
-run_step "Sanitize Caddyfile & validate" "
+# Strip imports and 'authentication { }' blocks if present
 awk 'BEGIN{skip=0}
   /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
   skip==1 { if (\$0 ~ /\\{/) depth++; if (\$0 ~ /\\}/){depth--; if (depth==0){skip=0; next}}; next }
   /^[[:space:]]*import[[:space:]]+/ {next}
   {print}
 ' '$CADDYFILE' > /etc/caddy/Caddyfile.tmp && mv -f /etc/caddy/Caddyfile.tmp '$CADDYFILE'
+
 caddy validate --config '$CADDYFILE'
 caddy adapt    --config '$CADDYFILE' --pretty > /tmp/caddy-adapt.json
 grep -q '\"handler\"\\s*:\\s*\"authentication\"' /tmp/caddy-adapt.json && { echo 'Authentication handler still present after sanitize.' >&2; exit 1; }
