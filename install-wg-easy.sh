@@ -60,7 +60,7 @@ tui_or_cli_prompts() {
     WG_DOMAIN=$(wt_input "wg-easy Domain" "Enter the domain for the wg-easy web UI:" "") || exit 1
     while [[ -z "$WG_DOMAIN" ]]; do WG_DOMAIN=$(wt_input "Required" "Domain cannot be empty:" "") || exit 1; done
     LE_EMAIL=$(wt_input "Let's Encrypt Email" "Email for ACME/Notices:" "") || exit 1
-    while [[ -z "$LE_EMAIL" ]]; do LE_EMAIL=$(wt_input "Required" "Email cannot be empty:" "") || exit 1; done
+    while [[ -n "${LE_EMAIL//[^@]/}" && -z "$LE_EMAIL" ]]; do LE_EMAIL=$(wt_input "Required" "Email cannot be empty:" "") || exit 1; done
     if wt_yesno "ACME Mode" "Use Let's Encrypt STAGING (test-only)?" ; then ACME_CA="https://acme-staging-v02.api.letsencrypt.org/directory"; else ACME_CA="https://acme-v02.api.letsencrypt.org/directory"; fi
     WG_HOST=$(wt_input "Public Hostname/IP" "Hostname or IP clients will reach:" "$WG_DOMAIN") || exit 1
     WG_PORT=$(wt_input "WireGuard UDP Port" "UDP port for WireGuard:" "51820") || exit 1
@@ -209,34 +209,51 @@ if ss -plnu | grep -qE "[:.]${WG_PORT}(\s|$)"; then
   else ask "Continue anyway? [y/N]:" cont_w "N"; [[ "$cont_w" =~ ^[Yy]$ ]] || { err "Please free UDP ${WG_PORT} and re-run."; exit 1; }; fi
 fi
 
+# ===== Pre-flight: Basicauth hash generation (robust + prompt on failure) =====
+BASIC_HASH=""
+if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]]; then
+  # sanitize username to safe set
+  BASIC_USER="$(printf "%s" "${BASIC_USER:-admin}" | tr -cd "A-Za-z0-9._-")"
+  # try caddy hasher first
+  if command -v caddy >/dev/null 2>&1; then
+    BASIC_HASH="$(caddy hash-password --plaintext "${BASIC_PASS}" 2>/dev/null | awk '/^\$2[aby]\$/{print; exit}' | tr -d '\r\n' || true)"
+  fi
+  # fallback: htpasswd -B (normalize $2y$ -> $2a$)
+  if [[ -z "$BASIC_HASH" ]]; then
+    BASIC_HASH="$(htpasswd -nbB x "${BASIC_PASS}" 2>/dev/null | cut -d: -f2 | sed 's/^\$2y\$/\$2a$/' | tr -d '\r\n' || true)"
+  fi
+  # validate hash; prompt if invalid
+  if [[ ! "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
+    warn "Could not generate a valid bcrypt hash for Caddy basicauth with current tools."
+    if (( WT )); then
+      if wt_yesno "Basicauth Hash Failed" "Disable basicauth and continue?\n(Choose No to abort and install prerequisites manually)"; then
+        ENABLE_BASICAUTH="N"
+      else
+        err "Aborting per user choice. Install caddy or apache2-utils and re-run."
+        exit 1
+      fi
+    else
+      ask "Disable basicauth and continue? [Y/n]:" PROCEED_NO_BA "Y"
+      if [[ "$PROCEED_NO_BA" =~ ^[Yy]$ ]]; then ENABLE_BASICAUTH="N"; else err "Aborting. Install caddy or apache2-utils and re-run."; exit 1; fi
+    fi
+  fi
+fi
+
 # ===== STEP_MAX calculation (procedural; no division by zero) =====
 STEP_MAX=0
-# 1 Update/base tools
-STEP_MAX=$((STEP_MAX+1))
-# 2 sysctl forwarding
-STEP_MAX=$((STEP_MAX+1))
-# 3 Docker Engine
-STEP_MAX=$((STEP_MAX+1))
-# 4 docker compose plugin
-STEP_MAX=$((STEP_MAX+1))
-# 5 Caddy
-STEP_MAX=$((STEP_MAX+1))
-# 6 wg-easy deployment files
-STEP_MAX=$((STEP_MAX+1))
-# 7 Caddyfile
-STEP_MAX=$((STEP_MAX+1))
-# optional: UFW
+STEP_MAX=$((STEP_MAX+1)) # 1 Update/base tools
+STEP_MAX=$((STEP_MAX+1)) # 2 sysctl forwarding
+STEP_MAX=$((STEP_MAX+1)) # 3 Docker Engine
+STEP_MAX=$((STEP_MAX+1)) # 4 docker compose plugin
+STEP_MAX=$((STEP_MAX+1)) # 5 Caddy
+STEP_MAX=$((STEP_MAX+1)) # 6 wg-easy files
+STEP_MAX=$((STEP_MAX+1)) # 7 Caddyfile
 if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-# optional: unattended-upgrades
 if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-# optional: fail2ban
 if [[ "$ENABLE_F2B" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-# 11 launch wg-easy
-STEP_MAX=$((STEP_MAX+1))
-# optional: compose autostart unit
+STEP_MAX=$((STEP_MAX+1)) # 11 launch wg-easy
 if [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-# 12 reload caddy
-STEP_MAX=$((STEP_MAX+1))
+STEP_MAX=$((STEP_MAX+1)) # 13 reload caddy
 
 APP_DIR="/opt/wg-easy"
 CONFIG_DIR="$APP_DIR/config"
@@ -275,7 +292,7 @@ mkdir -p $ACCESS_LOG_DIR
 chown -R caddy:caddy $ACCESS_LOG_DIR || true
 "
 
-# 6) wg-easy deployment files (bcrypt for wg-easy password)
+# 6) wg-easy deployment files (bcrypt for wg-easy admin password)
 WGEASY_PASS_HASH=$(htpasswd -nbB user "$WGEASY_ADMIN_PASS" | cut -d: -f2)
 run_step "Create wg-easy deployment files" "
 mkdir -p '$CONFIG_DIR'
@@ -312,19 +329,12 @@ EOF
 "
 
 # 7) Caddyfile (no empty blocks; safe for allowlist/basicauth combos)
-# Build optional snippets
 CADDY_BASICAUTH_LINE=""
-if [[ "$ENABLE_BASICAUTH" =~ ^[Yy]$ ]]; then
-  # Prefer caddy's hasher; if not present, fallback to htpasswd and normalize $2y$ -> $2a$
-  if command -v caddy >/dev/null 2>&1; then
-    BASIC_HASH="$(caddy hash-password --plaintext "$BASIC_PASS" 2>/dev/null | tr -d '\r\n')"
-  else
-    BASIC_HASH="$(htpasswd -nbB x "$BASIC_PASS" | cut -d: -f2 | sed 's/^\$2y\$/\$2a\$/')"
-  fi
+if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
   CADDY_BASICAUTH_LINE=$'    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }\n'
 fi
 
-if [[ -n "$IP_ALLOW_CIDR" ]]; then
+if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
   SITE_BODY=$(cat <<EOS
   log {
     output file $ACCESS_LOG_DIR/access.log
@@ -558,9 +568,8 @@ else
 fi
 
 # HTTPS reachability & cert info (best-effort)
-TLS_OK=0
 if [[ "$DNS_MATCH_IP" == "YES" && "$ACME_CA" != *"staging"* ]]; then
-  if curl -fsS --max-time 20 "https://${WG_DOMAIN}/" -o /dev/null; then ok "HTTPS reachable at https://${WG_DOMAIN}/"; TLS_OK=1; else warn "HTTPS not reachable yet (DNS/ACME may be pending)."; fi
+  if curl -fsS --max-time 20 "https://${WG_DOMAIN}/" -o /dev/null; then ok "HTTPS reachable at https://${WG_DOMAIN}/"; else warn "HTTPS not reachable yet (DNS/ACME may be pending)."; fi
 else
   [[ "$ACME_CA" == *"staging"* ]] && warn "Using Let's Encrypt STAGING (test-only certs)."
   [[ "$DNS_MATCH_IP" != "YES" ]] && warn "Domain may not point here yet; HTTPS check skipped."
@@ -590,8 +599,8 @@ WG Host:       ${WG_HOST}
 Tunnel CIDR:   ${WG_DEFAULT_ADDRESS}
 Client DNS:    ${WG_DEFAULT_DNS}
 IPv6 Fwd:      $( [[ "$ENABLE_IPV6" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
-Basic Auth:    $( [[ "$ENABLE_BASICAUTH" =~ ^[Yy]$ ]] && echo "ENABLED (user: ${BASIC_USER})" || echo "DISABLED" )
-IP Allowlist:  $( [[ -n "$IP_ALLOW_CIDR" ]] && echo "$IP_ALLOW_CIDR" || echo "None" )
+Basic Auth:    $( [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]] && echo "ENABLED (user: ${BASIC_USER})" || echo "DISABLED" )
+IP Allowlist:  $( [[ -n "${IP_ALLOW_CIDR:-}" ]] && echo "$IP_ALLOW_CIDR" || echo "None" )
 Firewall:      $( [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] && echo "UFW enabled" || echo "Not managed" )
 Auto updates:  $( [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
 fail2ban:      $( [[ "$ENABLE_F2B" =~ ^[Yy]$ ]] && echo "ENABLED (sshd + caddy-httperrors)" || echo "DISABLED" )
