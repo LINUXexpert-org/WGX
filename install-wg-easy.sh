@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-wg-easy.sh - Quiet, logged, interactive (TUI-capable) installer for WireGuard + wg-easy (Docker)
 # behind Caddy/Let's Encrypt on Debian 13. Includes unattended-upgrades, fail2ban, UFW,
-# explicit HTTP→HTTPS redirect, full pre/post-flight checks, percentage progress bar,
+# explicit HTTP→HTTPS redirect, pre/post-flight checks, percentage progress bar, robust BasicAuth pre-flight,
 # optional whiptail TUI, autostart for all services + compose stack, and a full logfile.
 #
 # Copyright (C) 2025 LINUXexpert.org
@@ -60,7 +60,7 @@ tui_or_cli_prompts() {
     WG_DOMAIN=$(wt_input "wg-easy Domain" "Enter the domain for the wg-easy web UI:" "") || exit 1
     while [[ -z "$WG_DOMAIN" ]]; do WG_DOMAIN=$(wt_input "Required" "Domain cannot be empty:" "") || exit 1; done
     LE_EMAIL=$(wt_input "Let's Encrypt Email" "Email for ACME/Notices:" "") || exit 1
-    while [[ -n "${LE_EMAIL//[^@]/}" && -z "$LE_EMAIL" ]]; do LE_EMAIL=$(wt_input "Required" "Email cannot be empty:" "") || exit 1; done
+    while [[ -z "$LE_EMAIL" ]]; do LE_EMAIL=$(wt_input "Required" "Email cannot be empty:" "") || exit 1; done
     if wt_yesno "ACME Mode" "Use Let's Encrypt STAGING (test-only)?" ; then ACME_CA="https://acme-staging-v02.api.letsencrypt.org/directory"; else ACME_CA="https://acme-v02.api.letsencrypt.org/directory"; fi
     WG_HOST=$(wt_input "Public Hostname/IP" "Hostname or IP clients will reach:" "$WG_DOMAIN") || exit 1
     WG_PORT=$(wt_input "WireGuard UDP Port" "UDP port for WireGuard:" "51820") || exit 1
@@ -212,17 +212,13 @@ fi
 # ===== Pre-flight: Basicauth hash generation (robust + prompt on failure) =====
 BASIC_HASH=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]]; then
-  # sanitize username to safe set
-  BASIC_USER="$(printf "%s" "${BASIC_USER:-admin}" | tr -cd "A-Za-z0-9._-")"
-  # try caddy hasher first
+  BASIC_USER="$(printf "%s" "${BASIC_USER:-admin}" | tr -cd "A-Za-z0-9._-")"   # sanitize
   if command -v caddy >/dev/null 2>&1; then
     BASIC_HASH="$(caddy hash-password --plaintext "${BASIC_PASS}" 2>/dev/null | awk '/^\$2[aby]\$/{print; exit}' | tr -d '\r\n' || true)"
   fi
-  # fallback: htpasswd -B (normalize $2y$ -> $2a$)
   if [[ -z "$BASIC_HASH" ]]; then
     BASIC_HASH="$(htpasswd -nbB x "${BASIC_PASS}" 2>/dev/null | cut -d: -f2 | sed 's/^\$2y\$/\$2a$/' | tr -d '\r\n' || true)"
   fi
-  # validate hash; prompt if invalid
   if [[ ! "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
     warn "Could not generate a valid bcrypt hash for Caddy basicauth with current tools."
     if (( WT )); then
@@ -328,7 +324,7 @@ services:
 EOF
 "
 
-# 7) Caddyfile (no empty blocks; safe for allowlist/basicauth combos)
+# 7) Caddyfile (no empty blocks; safe for allowlist/basicauth combos; NO 'authentication' providers)
 CADDY_BASICAUTH_LINE=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
   CADDY_BASICAUTH_LINE=$'    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }\n'
@@ -552,9 +548,6 @@ if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then
 fi
 if [[ "$ENABLE_F2B" =~ ^[Yy]$ ]]; then
   check "fail2ban enabled & active" 'systemctl is-enabled fail2ban >/dev/null && systemctl is-active --quiet fail2ban'
-fi
-if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then
-  check "unattended-upgrades enabled & active" 'systemctl is-enabled unattended-upgrades >/dev/null && systemctl is-active --quiet unattended-upgrades'
 fi
 
 # HTTP->HTTPS redirect verification
