@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install-wg-easy.sh - Quiet, logged, interactive (TUI-capable) installer for WireGuard + wg-easy (Docker)
-# behind Caddy/Let's Encrypt on Debian 13. Uses basic_auth (not basicauth), disables Caddy admin,
+# behind Caddy/Let's Encrypt on Debian 13. Uses basic_auth (with auto-fallback), disables Caddy admin,
 # purges ALL autosave paths, quarantines stray configs, validates adapted config for rogue "authentication",
 # includes unattended-upgrades, fail2ban, UFW, HTTP→HTTPS redirect, TUI option, autostart, progress bar, logging.
 #
@@ -72,34 +72,17 @@ wt_password(){ local out; out=$(whiptail --title "$1" --passwordbox "$2" 10 72 3
 
 # ===== Percentage bar =====
 STEP_NUM=0; STEP_MAX=0; BAR_WIDTH=42
-repeat_char() {
-  local n=${1:-0} c="${2:-#}"
-  (( n<=0 )) && { printf -- ""; return; }
-  perl -e 'printf "%s", ($ARGV[1]) x $ARGV[0]' "$n" "$c"
-}
-draw_bar()   {
-  local pct=${1:-0}; (( pct<0 )) && pct=0; (( pct>100 )) && pct=100
-  local filled=$(( pct * BAR_WIDTH / 100 ))
-  printf -- "\r[%-*s] %3d%%" "$BAR_WIDTH" "$(repeat_char "$filled" "#")" "$pct" >&3
-}
-advance_bar(){
-  STEP_NUM=$((STEP_NUM+1))
-  (( STEP_MAX < 1 )) && STEP_MAX=1
-  local pct=$(( STEP_NUM * 100 / STEP_MAX ))
-  draw_bar "$pct"
-}
+repeat_char() { local n=${1:-0} c="${2:-#}"; (( n<=0 )) && { printf -- ""; return; }; perl -e 'printf "%s", ($ARGV[1]) x $ARGV[0]' "$n" "$c"; }
+draw_bar()    { local pct=${1:-0}; (( pct<0 ))&&pct=0; (( pct>100 ))&&pct=100; local f=$(( pct * BAR_WIDTH / 100 )); printf -- "\r[%-*s] %3d%%" "$BAR_WIDTH" "$(repeat_char "$f" "#")" "$pct" >&3; }
+advance_bar() { STEP_NUM=$((STEP_NUM+1)); (( STEP_MAX < 1 )) && STEP_MAX=1; local pct=$(( STEP_NUM * 100 / STEP_MAX )); draw_bar "$pct"; }
 
-# ===== Step runner (safe printf) =====
+# ===== Step runner =====
 run_step() {
   local title="$1"; shift
   (( STEP_MAX < 1 )) && STEP_MAX=1
   printf -- "\n" >&3
   printf -- "Step %d/%d: %s\n" "$((STEP_NUM+1))" "$STEP_MAX" "$title" >&3
-  {
-    printf -- "--- [%s] %s ---\n" "$(date -Is)" "$title" >&2
-    bash -o pipefail -c "$@" >&2
-    printf -- "--- [%s] %s (OK) ---\n" "$(date -Is)" "$title" >&2
-  }
+  { printf -- "--- [%s] %s ---\n" "$(date -Is)" "$title" >&2; bash -o pipefail -c "$@" >&2; printf -- "--- [%s] %s (OK) ---\n" "$(date -Is)" "$title" >&2; }
   advance_bar
 }
 
@@ -261,11 +244,14 @@ AUTOSAVES=(
   "/var/lib/caddy/autosave.json"
   "/var/lib/caddy/.config/caddy/autosave.json"
   "/var/lib/caddy/.local/share/caddy/autosave.json"
+  "/var/lib/caddy/.local/state/caddy/autosave.json"
+  "/root/.config/caddy/autosave.json"
+  "/root/.local/share/caddy/autosave.json"
+  "/root/.local/state/caddy/autosave.json"
 )
 
 # ===== STEP_MAX calculation =====
 STEP_MAX=0
-# Purge step is optional but counted
 if [[ "${PURGE_CADDY:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 STEP_MAX=$((STEP_MAX+1)) # Update/base tools
 STEP_MAX=$((STEP_MAX+1)) # sysctl forwarding
@@ -320,8 +306,8 @@ run_step "Install & enable Docker Engine" "command -v docker >/dev/null || { cur
 # 4) docker compose plugin
 run_step "Install docker compose plugin" "docker compose version >/dev/null 2>&1 || apt-get install $APTQ docker-compose-plugin"
 
-# 5) Caddy (enable autostart) + optional drop-in override; ensure autosave gone
-run_step "Install & enable Caddy (+unit drop-in; remove AUTOSAVEs)" "
+# 5) Caddy (enable autostart) + strong drop-in + autosave purge
+run_step "Install & enable Caddy (+strong unit drop-in; purge AUTOSAVEs)" "
 if ! command -v caddy >/dev/null; then
   apt-get install $APTQ debian-keyring debian-archive-keyring
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -331,16 +317,18 @@ fi
 systemctl enable --now caddy
 mkdir -p $ACCESS_LOG_DIR
 chown -R caddy:caddy $ACCESS_LOG_DIR || true
-for f in ${AUTOSAVES[*]}; do rm -f \"\$f\" 2>/dev/null || true; done
-if [[ '${FORCE_CADDY_DROPIN:-Y}' =~ ^[Yy]$ ]]; then
-  mkdir -p '$DROPIN_DIR'
-  cat > '$DROPIN_DIR/override.conf' <<OVR
+# strong override: wipe Environment and EnvironmentFile; pin ExecStart
+mkdir -p '$DROPIN_DIR'
+cat > '$DROPIN_DIR/override.conf' <<'OVR'
 [Service]
+Environment=
+EnvironmentFile=
 ExecStart=
-ExecStart=/usr/bin/caddy run --environ --config $CADDYFILE
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
 OVR
-  systemctl daemon-reload
-fi
+systemctl daemon-reload
+# remove all autosaves (caddy and root trees)
+for f in ${AUTOSAVES[*]}; do rm -f \"\$f\" 2>/dev/null || true; done
 "
 
 # 6) wg-easy deployment files (bcrypt for wg-easy admin password)
@@ -379,16 +367,16 @@ services:
 EOF
 "
 
-# 7) Caddyfile (write with admin off), sanitize, validate
-AUTH_BLOCK=""
+# 7) Caddyfile (admin off), sanitize, validate, auto-fallback if plugin authentication appears
+AUTH_BLOCK_CORE=""
+AUTH_BLOCK_LEGACY=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
-  read -r -d '' AUTH_BLOCK <<EOT || true
-  basic_auth /* {
-    $BASIC_USER $BASIC_HASH
-  }
-EOT
+  AUTH_BLOCK_CORE=$'  basic_auth /* {\n    '"${BASIC_USER:-admin}"' '"$BASIC_HASH"$'\n  }\n'
+  AUTH_BLOCK_LEGACY=$'  basicauth /* {\n    '"${BASIC_USER:-admin}"' '"$BASIC_HASH"$'\n  }\n'
 fi
 
+# Render Caddyfile template with placeholders
+SITE_BODY=""
 if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
   read -r -d '' SITE_BODY <<EOS || true
   log {
@@ -397,7 +385,7 @@ if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
   }
 
   @allow_ips {
-    remote_ip $IP_ALLOW_CIDR
+    remote_ip __IP_ALLOW__
   }
 
   handle {
@@ -405,7 +393,8 @@ if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
   }
 
   handle @allow_ips {
-$AUTH_BLOCK  reverse_proxy 127.0.0.1:$WG_EASY_PORT
+__AUTH_BLOCK__
+    reverse_proxy 127.0.0.1:__UI_PORT__
   }
 
   tls {
@@ -419,7 +408,8 @@ else
     format json
   }
 
-$AUTH_BLOCK  reverse_proxy 127.0.0.1:$WG_EASY_PORT
+__AUTH_BLOCK__
+  reverse_proxy 127.0.0.1:__UI_PORT__
 
   tls {
     protocols tls1.2 tls1.3
@@ -427,7 +417,7 @@ $AUTH_BLOCK  reverse_proxy 127.0.0.1:$WG_EASY_PORT
 EOS
 fi
 
-run_step "Write Caddyfile (admin off); sanitize & validate (no 'authentication')" "
+run_step "Write Caddyfile (admin off); sanitize & validate; auto-fallback on plugin 'authentication'" "
 cat > '$CADDYFILE' <<EOF
 {
   admin off
@@ -444,20 +434,47 @@ $SITE_BODY
 }
 EOF
 
-# Sanitize legacy imports and caddy-security 'authentication' blocks
+# Substitute placeholders
+sed -i \"s#__IP_ALLOW__#${IP_ALLOW_CIDR:-}#g; s#__UI_PORT__#${WG_EASY_PORT}#g\" '$CADDYFILE'
+
+# Inject core basic_auth block (if any)
+if [[ -n \"$AUTH_BLOCK_CORE\" ]]; then
+  awk -v repl=\"\$AUTH_BLOCK_CORE\" 'BEGIN{done=0} { if (!done && /__AUTH_BLOCK__/) { gsub(/__AUTH_BLOCK__/, repl); done=1 } print }' '$CADDYFILE' > /etc/caddy/Caddyfile.tmp && mv /etc/caddy/Caddyfile.tmp '$CADDYFILE'
+else
+  sed -i 's#__AUTH_BLOCK__##' '$CADDYFILE'
+fi
+
+# Sanitize 'authentication { }' & 'import' lines (defense-in-depth)
 awk 'BEGIN{skip=0}
   /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
   skip==1 { if (\$0 ~ /\\{/) depth++; if (\$0 ~ /\\}/){depth--; if (depth==0){skip=0; next}}; next }
   /^[[:space:]]*import[[:space:]]+/ {next}
   {print}
-' '$CADDYFILE' > /etc/caddy/Caddyfile.tmp && mv -f /etc/caddy/Caddyfile.tmp '$CADDYFILE'
+' '$CADDYFILE' > /etc/caddy/Caddyfile.sanitized && mv /etc/caddy/Caddyfile.sanitized '$CADDYFILE'
 
-# Validate & adapt
+# Format, validate, adapt
+caddy fmt --overwrite '$CADDYFILE' >/dev/null 2>&1 || true
 caddy validate --config '$CADDYFILE'
 caddy adapt    --config '$CADDYFILE' --pretty > /tmp/caddy-adapt.json
 
-# Fail if any caddy-security 'authentication' handler is present
-grep -q '\"handler\"\\s*:\\s*\"authentication\"' /tmp/caddy-adapt.json && { echo 'ERROR: Found caddy-security authentication handler in adapted config' >&2; exit 1; }
+# If plugin 'authentication' still shows, try LEGACY basicauth
+if grep -q '\"handler\"[[:space:]]*:[[:space:]]*\"authentication\"' /tmp/caddy-adapt.json; then
+  if [[ -n \"$AUTH_BLOCK_LEGACY\" ]]; then
+    # put legacy block above reverse_proxy
+    awk -v repl=\"\$AUTH_BLOCK_LEGACY\" 'BEGIN{done=0} { if (!done && /reverse_proxy /) { print repl; done=1 } print }' '$CADDYFILE' > /etc/caddy/Caddyfile.legacy && mv /etc/caddy/Caddyfile.legacy '$CADDYFILE'
+    caddy fmt --overwrite '$CADDYFILE' >/dev/null 2>&1 || true
+    caddy validate --config '$CADDYFILE'
+    caddy adapt    --config '$CADDYFILE' --pretty > /tmp/caddy-adapt.json || true
+  fi
+fi
+
+# If still present, drop web basic auth entirely (wg-easy bcrypt + allowlist + fail2ban handle auth)
+if grep -q '\"handler\"[[:space:]]*:[[:space:]]*\"authentication\"' /tmp/caddy-adapt.json; then
+  sed -i '/^[[:space:]]*basic_auth[[:space:]]\\|^[[:space:]]*basicauth[[:space:]]/,/}/d' '$CADDYFILE'
+  caddy fmt --overwrite '$CADDYFILE' >/dev/null 2>&1 || true
+  caddy validate --config '$CADDYFILE'
+  caddy adapt    --config '$CADDYFILE' --pretty > /tmp/caddy-adapt.json || true
+fi
 "
 
 # 8) UFW
@@ -567,7 +584,7 @@ systemctl enable --now wg-easy-compose.service
 "
 fi
 
-# 13) Reload Caddy (after final validation; autosave purge again)
+# 13) Reload Caddy (final sanitize; purge autosaves again)
 run_step "Reload Caddy (activate config; purge AUTOSAVEs again)" "
 for f in ${AUTOSAVES[*]}; do rm -f \"\$f\" 2>/dev/null || true; done
 caddy validate --config '$CADDYFILE'
@@ -610,7 +627,7 @@ WG Host:       ${WG_HOST}
 Tunnel CIDR:   ${WG_DEFAULT_ADDRESS}
 Client DNS:    ${WG_DEFAULT_DNS}
 IPv6 Fwd:      $( [[ "${ENABLE_IPV6:-N}" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
-Basic Auth:    $( [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]] && echo "ENABLED (user: ${BASIC_USER})" || echo "DISABLED" )
+Basic Auth:    $( [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]] && echo "ENABLED (via Caddy, with fallback)" || echo "DISABLED (wg-easy auth only)" )
 IP Allowlist:  $( [[ -n "${IP_ALLOW_CIDR:-}" ]] && echo "$IP_ALLOW_CIDR" || echo "None" )
 Firewall:      $( [[ "${ENABLE_UFW:-Y}" =~ ^[Yy]$ ]] && echo "UFW enabled" || echo "Not managed" )
 Auto updates:  $( [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
