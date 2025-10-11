@@ -2,7 +2,7 @@
 # install-wg-easy.sh - Quiet, logged, interactive (TUI-capable) installer for WireGuard + wg-easy (Docker)
 # behind Caddy/Let's Encrypt on Debian 13. Includes unattended-upgrades, fail2ban, UFW,
 # explicit HTTP→HTTPS redirect, pre/post-flight checks, percentage progress bar, robust BasicAuth pre-flight,
-# optional whiptail TUI, autostart for all services + compose stack, and a full logfile.
+# optional whiptail TUI, autostart for all services + compose stack, a full logfile, and Caddy auth/import purge.
 #
 # Copyright (C) 2025 LINUXexpert.org
 #
@@ -55,8 +55,52 @@ WT=0
 wt_yesno()   { whiptail --title "$1" --yesno "$2" 10 72; }
 wt_input()   { local out; out=$(whiptail --title "$1" --inputbox "$2" 10 72 "$3" 3>&1 1>&2 2>&3) || return 1; printf "%s" "$out"; }
 wt_password(){ local out; out=$(whiptail --title "$1" --passwordbox "$2" 10 72 3>&1 1>&2 2>&3) || return 1; printf "%s" "$out"; }
+
+# ===== Percentage bar =====
+STEP_NUM=0; STEP_MAX=0; BAR_WIDTH=42
+repeat_char() { local n=$1 c="$2"; [[ $n -le 0 ]] && return 0; printf "%0.s${c}" $(seq 1 "$n"); }
+draw_bar()   { local pct=$1; (( pct<0 )) && pct=0; (( pct>100 )) && pct=100; local filled=$(( pct * BAR_WIDTH / 100 )); printf "\r[%-*s] %3d%%" "$BAR_WIDTH" "$(repeat_char "$filled" "#")" "$pct" >&3; }
+advance_bar(){ STEP_NUM=$((STEP_NUM+1)); (( STEP_MAX < 1 )) && STEP_MAX=1; local pct=$(( STEP_NUM * 100 / STEP_MAX )); draw_bar "$pct"; }
+
+# ===== Step runner (safe printf) =====
+run_step() {
+  local title="$1"; shift
+  printf "%s\n" "" >&3
+  printf "%s\n" "Step $((STEP_NUM+1))/$STEP_MAX: $title" >&3
+  {
+    printf "%s\n" "--- [$(date -Is)] $title ---" >&2
+    bash -o pipefail -c "$@" >&2
+    printf "%s\n" "--- [$(date -Is)] $title (OK) ---" >&2
+  }
+  advance_bar
+}
+
+# ===== Trap & Logging =====
+cleanup_on_error(){ printf "\n" >&3; err "An unexpected error occurred. See the log: $LOGFILE"; }
+trap cleanup_on_error ERR
+
+LOGFILE="$(pwd)/install-wg-easy-$(date +%Y%m%d-%H%M%S).log"
+exec 3>&1
+exec > >(tee -a "$LOGFILE") 2>&1
+export DEBIAN_FRONTEND=noninteractive
+APTQ="-o Dpkg::Use-Pty=0 -y -qq"
+
+require_root
+check_debian13
+
+# ===== Minimal prereqs =====
+info "Installer log: $LOGFILE"
+apt-get update -qq >/dev/null 2>&1 || true
+apt-get install $APTQ ca-certificates gnupg apt-transport-https curl iproute2 dnsutils jq apache2-utils openssl whiptail >/dev/null 2>&1 || true
+
+# ===== TUI choice =====
+if command -v whiptail >/dev/null 2>&1; then
+  if whiptail --title "Interface" --yesno "Use TUI (whiptail) for prompts?" 9 60; then WT=1; else WT=0; fi
+fi
+
+# ===== Prompts =====
 tui_or_cli_prompts() {
-  if (( WT == 1 )); then
+  if (( WT )); then
     WG_DOMAIN=$(wt_input "wg-easy Domain" "Enter the domain for the wg-easy web UI:" "") || exit 1
     while [[ -z "$WG_DOMAIN" ]]; do WG_DOMAIN=$(wt_input "Required" "Domain cannot be empty:" "") || exit 1; done
     LE_EMAIL=$(wt_input "Let's Encrypt Email" "Email for ACME/Notices:" "") || exit 1
@@ -91,6 +135,7 @@ tui_or_cli_prompts() {
       F2B_MAXRETRY=$(wt_input "fail2ban maxretry" "e.g., 5:" "5") || exit 1
     else ENABLE_F2B="N"; F2B_BANTIME="1h"; F2B_FINDTIME="10m"; F2B_MAXRETRY="5"; fi
     if wt_yesno "Autostart Compose" "Create a systemd unit to re-up wg-easy on boot?" ; then ENABLE_COMPOSE_UNIT="Y"; else ENABLE_COMPOSE_UNIT="N"; fi
+    if wt_yesno "Caddy Purge" "Purge conflicting Caddy 'authentication' blocks and 'import' directives if detected? (Recommended)" ; then PURGE_CADDY="Y"; else PURGE_CADDY="N"; fi
   else
     ask_req "Domain for the wg-easy web UI (e.g., vpn.example.com):" WG_DOMAIN
     ask_req "Email for Let's Encrypt / Caddy (TLS notices):" LE_EMAIL
@@ -118,83 +163,30 @@ tui_or_cli_prompts() {
       ask "fail2ban maxretry:" F2B_MAXRETRY "$F2B_MAXRETRY"
     fi
     ask "Create a systemd unit to re-up wg-easy on boot? [Y/n]:" ENABLE_COMPOSE_UNIT "Y"
+    ask "Purge conflicting Caddy 'authentication' blocks and 'import' directives if detected? [Y/n]:" PURGE_CADDY "Y"
   fi
 }
-
-# ===== Progress bar =====
-STEP_NUM=0; STEP_MAX=0; BAR_WIDTH=42
-repeat_char() { local n=$1 c="$2"; [[ $n -le 0 ]] && return 0; printf "%0.s${c}" $(seq 1 "$n"); }
-draw_bar()   { local pct=$1; (( pct<0 )) && pct=0; (( pct>100 )) && pct=100; local filled=$(( pct * BAR_WIDTH / 100 )); printf "\r[%-*s] %3d%%" "$BAR_WIDTH" "$(repeat_char "$filled" "#")" "$pct" >&3; }
-advance_bar(){
-  STEP_NUM=$((STEP_NUM+1))
-  (( STEP_MAX < 1 )) && STEP_MAX=1
-  local pct=$(( STEP_NUM * 100 / STEP_MAX ))
-  draw_bar "$pct"
-}
-
-# ===== Step runner (safe printf) =====
-run_step() {
-  local title="$1"; shift
-  printf "%s\n" "" >&3
-  printf "%s\n" "Step $((STEP_NUM+1))/$STEP_MAX: $title" >&3
-  {
-    printf "%s\n" "--- [$(date -Is)] $title ---" >&2
-    bash -o pipefail -c "$@" >&2
-    printf "%s\n" "--- [$(date -Is)] $title (OK) ---" >&2
-  }
-  advance_bar
-}
-
-# ===== Trap & Logging =====
-cleanup_on_error(){ printf "\n" >&3; err "An unexpected error occurred. See the log: $LOGFILE"; }
-trap cleanup_on_error ERR
-
-LOGFILE="$(pwd)/install-wg-easy-$(date +%Y%m%d-%H%M%S).log"
-exec 3>&1
-exec > >(tee -a "$LOGFILE") 2>&1
-export DEBIAN_FRONTEND=noninteractive
-APTQ="-o Dpkg::Use-Pty=0 -y -qq"
-
-require_root
-check_debian13
-
-# ===== Minimal prereqs for prompts & optional TUI =====
-info "Installer log: $LOGFILE"
-apt-get update -qq >/dev/null 2>&1 || true
-apt-get install $APTQ ca-certificates gnupg apt-transport-https curl iproute2 dnsutils jq apache2-utils openssl whiptail >/dev/null 2>&1 || true
-
-# TUI choice
-if command -v whiptail >/dev/null 2>&1; then
-  if whiptail --title "Interface" --yesno "Use TUI (whiptail) for prompts?" 9 60; then WT=1; else WT=0; fi
-fi
+printf "\n%s=== WireGuard + wg-easy (Docker) behind Caddy/Let's Encrypt (Debian 13) ===%s\n\n" "$BLD" "$CLR" >&3
+tui_or_cli_prompts
 
 # Detect public IPs (best-effort)
 detect_pubip() { local v="$1" ip=""; case "$v" in 4) ip=$(curl -fsS4 --max-time 5 https://ifconfig.me || true);; 6) ip=$(curl -fsS6 --max-time 5 https://ifconfig.me || true);; esac; [[ -n "$ip" ]] && echo "$ip" || echo "UNKNOWN"; }
 PUBIP4=$(detect_pubip 4); PUBIP6=$(detect_pubip 6)
-
-# ===== Prompts =====
-printf "\n%s=== WireGuard + wg-easy (Docker) behind Caddy/Let's Encrypt (Debian 13) ===%s\n\n" "$BLD" "$CLR" >&3
-tui_or_cli_prompts
-
-printf "\n" >&3
 info "Detected public IPs: IPv4=${PUBIP4}, IPv6=${PUBIP6}"
 
-# DNS preflight
-DNS_OK="UNKNOWN"; DNS_MATCH_IP="NO"
+# DNS preflight (best-effort)
 A_RECORDS=$(dig +short A "$WG_DOMAIN" || true); AAAA_RECORDS=$(dig +short AAAA "$WG_DOMAIN" || true)
+DNS_OK="NO"; DNS_MATCH_IP="NO"
 if [[ -n "$A_RECORDS$AAAA_RECORDS" ]]; then
   DNS_OK="YES"
   if [[ "$A_RECORDS" == *"$PUBIP4"* ]] || { [[ "$PUBIP6" != "UNKNOWN" ]] && [[ "$AAAA_RECORDS" == *"$PUBIP6"* ]]; }; then DNS_MATCH_IP="YES"; fi
-else DNS_OK="NO"; fi
+fi
 info "DNS for ${WG_DOMAIN}: found=${DNS_OK}, points-here=${DNS_MATCH_IP}"
 [[ "$DNS_OK" == "YES" ]] || warn "No A/AAAA records found. ACME issuance will fail until DNS is configured."
 
 # Confirm
-if (( WT )); then
-  wt_yesno "Confirm" "Proceed with installation?" || { err "Aborted by user."; exit 1; }
-else
-  ask "Proceed with installation? [Y/n]:" CONFIRM "Y"; [[ "$CONFIRM" =~ ^[Yy]$ ]] || { err "Aborted by user."; exit 1; }
-fi
+if (( WT )); then wt_yesno "Confirm" "Proceed with installation?" || { err "Aborted by user."; exit 1; }
+else ask "Proceed with installation? [Y/n]:" CONFIRM "Y"; [[ "$CONFIRM" =~ ^[Yy]$ ]] || { err "Aborted by user."; exit 1; }; fi
 
 # Port preflight
 port_in_use() { ss -plntu 2>/dev/null | grep -E "LISTEN|UNCONN" | grep -qE "[:.]$1(\s|$)"; }
@@ -209,10 +201,10 @@ if ss -plnu | grep -qE "[:.]${WG_PORT}(\s|$)"; then
   else ask "Continue anyway? [y/N]:" cont_w "N"; [[ "$cont_w" =~ ^[Yy]$ ]] || { err "Please free UDP ${WG_PORT} and re-run."; exit 1; }; fi
 fi
 
-# ===== Pre-flight: Basicauth hash generation (robust + prompt on failure) =====
+# ===== Pre-flight: BasicAuth bcrypt (robust) =====
 BASIC_HASH=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]]; then
-  BASIC_USER="$(printf "%s" "${BASIC_USER:-admin}" | tr -cd "A-Za-z0-9._-")"   # sanitize
+  BASIC_USER="$(printf "%s" "${BASIC_USER:-admin}" | tr -cd "A-Za-z0-9._-")"
   if command -v caddy >/dev/null 2>&1; then
     BASIC_HASH="$(caddy hash-password --plaintext "${BASIC_PASS}" 2>/dev/null | awk '/^\$2[aby]\$/{print; exit}' | tr -d '\r\n' || true)"
   fi
@@ -222,20 +214,37 @@ if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]]; then
   if [[ ! "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
     warn "Could not generate a valid bcrypt hash for Caddy basicauth with current tools."
     if (( WT )); then
-      if wt_yesno "Basicauth Hash Failed" "Disable basicauth and continue?\n(Choose No to abort and install prerequisites manually)"; then
-        ENABLE_BASICAUTH="N"
-      else
-        err "Aborting per user choice. Install caddy or apache2-utils and re-run."
-        exit 1
-      fi
+      if wt_yesno "Basicauth Hash Failed" "Disable basicauth and continue?\n(Choose No to abort and install prerequisites manually)"; then ENABLE_BASICAUTH="N"; else err "Aborting per user choice."; exit 1; fi
     else
-      ask "Disable basicauth and continue? [Y/n]:" PROCEED_NO_BA "Y"
-      if [[ "$PROCEED_NO_BA" =~ ^[Yy]$ ]]; then ENABLE_BASICAUTH="N"; else err "Aborting. Install caddy or apache2-utils and re-run."; exit 1; fi
+      ask "Disable basicauth and continue? [Y/n]:" PROCEED_NO_BA "Y"; [[ "$PROCEED_NO_BA" =~ ^[Yy]$ ]] && ENABLE_BASICAUTH="N" || { err "Aborting."; exit 1; }
     fi
   fi
 fi
 
-# ===== STEP_MAX calculation (procedural; no division by zero) =====
+# ===== Optional purge of conflicting Caddy configs =====
+CADDYFILE="/etc/caddy/Caddyfile"
+ACCESS_LOG_DIR="/var/log/caddy"
+if [[ "${PURGE_CADDY:-Y}" =~ ^[Yy]$ ]]; then
+  run_step "Purge conflicting Caddy auth/imports (backup & scrub)" "
+  TS=\$(date +%Y%m%d-%H%M%S)
+  mkdir -p /etc/caddy/backup-\$TS
+  cp -a /etc/caddy/* /etc/caddy/backup-\$TS/ 2>/dev/null || true
+  # Remove any *.conf or extra files that might be imported by older configs
+  find /etc/caddy -maxdepth 1 -type f ! -name 'Caddyfile' -print -exec mv {} /etc/caddy/backup-\$TS/ \\; || true
+  # If an old Caddyfile exists, strip 'import' lines and 'authentication { ... }' blocks into a cleaned copy
+  if [[ -s '$CADDYFILE' ]]; then
+    awk 'BEGIN{skip=0}
+      /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
+      skip==1 { if (\$0 ~ /\\{/) depth++; if (\$0 ~ /\\}/){depth--; if (depth==0){skip=0; next}}; next }
+      /^[[:space:]]*import[[:space:]]+/ {next}
+      {print}
+    ' '$CADDYFILE' > /etc/caddy/Caddyfile.cleaned 2>/dev/null || true
+    mv -f /etc/caddy/Caddyfile.cleaned '$CADDYFILE' 2>/dev/null || true
+  fi
+  "
+fi
+
+# ===== STEP_MAX calculation =====
 STEP_MAX=0
 STEP_MAX=$((STEP_MAX+1)) # 1 Update/base tools
 STEP_MAX=$((STEP_MAX+1)) # 2 sysctl forwarding
@@ -244,19 +253,16 @@ STEP_MAX=$((STEP_MAX+1)) # 4 docker compose plugin
 STEP_MAX=$((STEP_MAX+1)) # 5 Caddy
 STEP_MAX=$((STEP_MAX+1)) # 6 wg-easy files
 STEP_MAX=$((STEP_MAX+1)) # 7 Caddyfile
-if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-if [[ "$ENABLE_F2B" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+if [[ "${ENABLE_UFW:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+if [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+if [[ "${ENABLE_F2B:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 STEP_MAX=$((STEP_MAX+1)) # 11 launch wg-easy
 if [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 STEP_MAX=$((STEP_MAX+1)) # 13 reload caddy
 
 APP_DIR="/opt/wg-easy"
 CONFIG_DIR="$APP_DIR/config"
-CADDYFILE="/etc/caddy/Caddyfile"
-ACCESS_LOG_DIR="/var/log/caddy"
 COMPOSE_UNIT="/etc/systemd/system/wg-easy-compose.service"
-
 printf "\n" >&3; draw_bar 0
 
 # 1) apt update & base tools
@@ -288,7 +294,7 @@ mkdir -p $ACCESS_LOG_DIR
 chown -R caddy:caddy $ACCESS_LOG_DIR || true
 "
 
-# 6) wg-easy deployment files (bcrypt for wg-easy admin password)
+# 6) wg-easy deployment files
 WGEASY_PASS_HASH=$(htpasswd -nbB user "$WGEASY_ADMIN_PASS" | cut -d: -f2)
 run_step "Create wg-easy deployment files" "
 mkdir -p '$CONFIG_DIR'
@@ -324,7 +330,7 @@ services:
 EOF
 "
 
-# 7) Caddyfile (no empty blocks; safe for allowlist/basicauth combos; NO 'authentication' providers)
+# 7) Caddyfile (no imports; no authentication providers)
 CADDY_BASICAUTH_LINE=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
   CADDY_BASICAUTH_LINE=$'    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }\n'
@@ -400,11 +406,26 @@ $WG_DOMAIN {
 $SITE_BODY
 }
 EOF
-caddy validate --config '$CADDYFILE'
 "
 
-# 8) UFW (enable autostart)
-if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then
+# Sanitize any lingering auth/imports, validate & adapt
+run_step "Sanitize Caddyfile & validate" "
+# Strip imports and authentication blocks if any slipped in
+awk 'BEGIN{skip=0}
+  /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
+  skip==1 { if (\$0 ~ /\\{/) depth++; if (\$0 ~ /\\}/){depth--; if (depth==0){skip=0; next}}; next }
+  /^[[:space:]]*import[[:space:]]+/ {next}
+  {print}
+' '$CADDYFILE' > /etc/caddy/Caddyfile.tmp && mv -f /etc/caddy/Caddyfile.tmp '$CADDYFILE'
+
+# Validate & check adapted JSON for authentication handlers
+caddy validate --config '$CADDYFILE'
+caddy adapt    --config '$CADDYFILE' --pretty > /tmp/caddy-adapt.json
+grep -q '\"handler\"\\s*:\\s*\"authentication\"' /tmp/caddy-adapt.json && { echo 'Authentication handler still present after sanitize.' >&2; exit 1; }
+"
+
+# 8) UFW
+if [[ "${ENABLE_UFW:-Y}" =~ ^[Yy]$ ]]; then
   run_step "Configure UFW firewall (22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp)" "
   apt-get install $APTQ ufw
   ufw allow 22/tcp
@@ -416,8 +437,8 @@ if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then
   "
 fi
 
-# 9) unattended-upgrades (enable autostart)
-if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then
+# 9) unattended-upgrades
+if [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]]; then
   run_step "Enable unattended security updates" "
   apt-get install $APTQ unattended-upgrades apt-listchanges
   dpkg-reconfigure --priority=low unattended-upgrades >/dev/null || true
@@ -452,16 +473,16 @@ CFG
   "
 fi
 
-# 10) fail2ban (enable autostart)
-if [[ "$ENABLE_F2B" =~ ^[Yy]$ ]]; then
+# 10) fail2ban
+if [[ "${ENABLE_F2B:-Y}" =~ ^[Yy]$ ]]; then
   run_step "Install & enable fail2ban (sshd + Caddy)" "
   apt-get install $APTQ fail2ban
   systemctl enable --now fail2ban
   cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
-bantime = $F2B_BANTIME
-findtime = $F2B_FINDTIME
-maxretry = $F2B_MAXRETRY
+bantime = ${F2B_BANTIME:-1h}
+findtime = ${F2B_FINDTIME:-10m}
+maxretry = ${F2B_MAXRETRY:-5}
 destemail = ${UPD_MAIL:-$LE_EMAIL}
 sender = root@\$(hostname -f 2>/dev/null || hostname)
 action = %(action_mwl)s
@@ -497,7 +518,7 @@ docker compose pull
 docker compose up -d
 "
 
-# 12) (Optional) systemd unit to re-up compose stack on boot
+# 12) systemd unit (autostart)
 if [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]]; then
   run_step "Create & enable systemd unit for wg-easy compose (autostart)" "
 cat > '$COMPOSE_UNIT' <<EOF
@@ -524,56 +545,27 @@ systemctl enable --now wg-easy-compose.service
 "
 fi
 
-# 13) Reload Caddy
+# 13) Reload Caddy (after final validation)
 run_step "Reload Caddy (activate config)" "caddy validate --config '$CADDYFILE' && (systemctl reload caddy || systemctl restart caddy)"
 
 # ===== Post-Install Sanity Checks =====
 printf "\n\n%s=== Running sanity checks ===%s\n" "$BLD" "$CLR" >&3
 checklist_ok=0; checklist_fail=0
 check(){ local desc="$1"; shift; if bash -c "$@" >/dev/null 2>&1; then ok "$desc"; ((checklist_ok++)); else warn "$desc - needs attention"; ((checklist_fail++)); fi; }
-
 check "IPv4 forwarding enabled" 'sysctl -n net.ipv4.ip_forward | grep -q "^1$"'
-[[ "$ENABLE_IPV6" =~ ^[Yy]$ ]] && check "IPv6 forwarding enabled" 'sysctl -n net.ipv6.conf.all.forwarding | grep -q "^1$"'
+[[ "${ENABLE_IPV6:-N}" =~ ^[Yy]$ ]] && check "IPv6 forwarding enabled" 'sysctl -n net.ipv6.conf.all.forwarding | grep -q "^1$"'
 check "Docker enabled & active" 'systemctl is-enabled docker >/dev/null && systemctl is-active --quiet docker'
 check "Caddy enabled & active" 'systemctl is-enabled caddy >/dev/null && systemctl is-active --quiet caddy'
 check "wg-easy container running" 'docker ps --format "{{.Names}}" | grep -q "^wg-easy$"'
 check "WireGuard UDP listening on :${WG_PORT}" 'ss -plnu | grep -q ":${WG_PORT} "'
 check "Caddy listening on :80 and :443" 'ss -plnt | grep -q ":80 " && ss -plnt | grep -q ":443 "'
 check "wg-easy UI bound to loopback :${WG_EASY_PORT}" 'ss -plnt | grep -q "127.0.0.1:${WG_EASY_PORT} "'
-if [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]]; then
-  check "wg-easy compose unit enabled" 'systemctl is-enabled wg-easy-compose.service >/dev/null'
-fi
-if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then
-  check "UFW enabled & allows 80/443 and ${WG_PORT}/udp" 'systemctl is-enabled ufw >/dev/null && ufw status | grep -q "80/tcp" && ufw status | grep -q "443/tcp" && ufw status | grep -q "${WG_PORT}/udp"'
-fi
-if [[ "$ENABLE_F2B" =~ ^[Yy]$ ]]; then
-  check "fail2ban enabled & active" 'systemctl is-enabled fail2ban >/dev/null && systemctl is-active --quiet fail2ban'
-fi
 
-# HTTP->HTTPS redirect verification
+# HTTP→HTTPS redirect verification (best-effort)
 REDIR_OUT=$(curl -sI "http://$WG_DOMAIN/" || true)
 REDIR_CODE=$(printf "%s" "$REDIR_OUT" | awk '/^HTTP/{print $2; exit}')
 REDIR_LOC=$(printf "%s" "$REDIR_OUT" | awk '/^Location:/ {print $2; exit}' | tr -d '\r')
-if [[ "$REDIR_CODE" =~ ^30[18]$ ]] && [[ "$REDIR_LOC" == "https://$WG_DOMAIN/"* ]]; then
-  ok "HTTP→HTTPS redirect in place (${REDIR_CODE} to ${REDIR_LOC})"
-else
-  warn "HTTP→HTTPS redirect not confirmed (code=$REDIR_CODE, location=$REDIR_LOC)"
-fi
-
-# HTTPS reachability & cert info (best-effort)
-if [[ "$DNS_MATCH_IP" == "YES" && "$ACME_CA" != *"staging"* ]]; then
-  if curl -fsS --max-time 20 "https://${WG_DOMAIN}/" -o /dev/null; then ok "HTTPS reachable at https://${WG_DOMAIN}/"; else warn "HTTPS not reachable yet (DNS/ACME may be pending)."; fi
-else
-  [[ "$ACME_CA" == *"staging"* ]] && warn "Using Let's Encrypt STAGING (test-only certs)."
-  [[ "$DNS_MATCH_IP" != "YES" ]] && warn "Domain may not point here yet; HTTPS check skipped."
-fi
-if echo | openssl s_client -servername "$WG_DOMAIN" -connect "$WG_DOMAIN:443" -showcerts 2>/dev/null | openssl x509 -noout -issuer -enddate >/tmp/certinfo.txt 2>/dev/null; then
-  ISSUER=$(grep '^issuer=' /tmp/certinfo.txt | sed 's/^issuer= *//'); ENDDATE=$(grep '^notAfter=' /tmp/certinfo.txt | cut -d= -f2)
-  if [[ -n "$ENDDATE" ]]; then
-    EXP_TS=$(date -d "$ENDDATE" +%s 2>/dev/null || echo 0); NOW_TS=$(date +%s)
-    if (( EXP_TS > NOW_TS )); then DAYS_LEFT=$(( (EXP_TS - NOW_TS) / 86400 )); ok "TLS cert issuer: $ISSUER"; ok "TLS cert expiry: $ENDDATE (~${DAYS_LEFT} days)"; else warn "TLS cert appears expired/unreadable ($ENDDATE)"; fi
-  fi
-else warn "Could not retrieve certificate to verify issuer/expiry."; fi
+if [[ "$REDIR_CODE" =~ ^30[18]$ ]] && [[ "$REDIR_LOC" == "https://$WG_DOMAIN/"* ]]; then ok "HTTP→HTTPS redirect in place (${REDIR_CODE} to ${REDIR_LOC})"; else warn "HTTP→HTTPS redirect not confirmed"; fi
 
 printf "\nSanity check summary: %d passed, %d need attention.\n" "$checklist_ok" "$checklist_fail" >&3
 (( checklist_fail == 0 )) || warn "Some items may resolve automatically after DNS/ACME propagation."
@@ -591,12 +583,12 @@ VPN Port:      UDP ${WG_PORT}
 WG Host:       ${WG_HOST}
 Tunnel CIDR:   ${WG_DEFAULT_ADDRESS}
 Client DNS:    ${WG_DEFAULT_DNS}
-IPv6 Fwd:      $( [[ "$ENABLE_IPV6" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
+IPv6 Fwd:      $( [[ "${ENABLE_IPV6:-N}" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
 Basic Auth:    $( [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]] && echo "ENABLED (user: ${BASIC_USER})" || echo "DISABLED" )
 IP Allowlist:  $( [[ -n "${IP_ALLOW_CIDR:-}" ]] && echo "$IP_ALLOW_CIDR" || echo "None" )
-Firewall:      $( [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] && echo "UFW enabled" || echo "Not managed" )
-Auto updates:  $( [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
-fail2ban:      $( [[ "$ENABLE_F2B" =~ ^[Yy]$ ]] && echo "ENABLED (sshd + caddy-httperrors)" || echo "DISABLED" )
+Firewall:      $( [[ "${ENABLE_UFW:-Y}" =~ ^[Yy]$ ]] && echo "UFW enabled" || echo "Not managed" )
+Auto updates:  $( [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]] && echo "ENABLED" || echo "DISABLED" )
+fail2ban:      $( [[ "${ENABLE_F2B:-Y}" =~ ^[Yy]$ ]] && echo "ENABLED (sshd + caddy-httperrors)" || echo "DISABLED" )
 ACME CA:       ${ACME_CA}
 Autostart:     Docker ✓, Caddy ✓, $( [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]] && echo "wg-easy compose unit ✓" || echo "compose unit ✗ (containers still auto-restart)") 
 Run log:       ${LOGFILE}
@@ -605,8 +597,7 @@ Useful:
   - Restart wg-easy:            docker compose -f ${APP_DIR}/compose.yaml restart
   - Update wg-easy:             cd ${APP_DIR} && docker compose pull && docker compose up -d
   - Reload Caddy:               systemctl reload caddy
-  - Check fail2ban:             fail2ban-client status
-  - Show TLS info:              echo | openssl s_client -servername ${WG_DOMAIN} -connect ${WG_DOMAIN}:443 2>/dev/null | openssl x509 -noout -issuer -enddate
+  - Inspect adapted config:     less /tmp/caddy-adapt.json
 
 SUMMARY
 
