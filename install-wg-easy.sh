@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # install-wg-easy.sh - Quiet, logged, interactive (TUI-capable) installer for WireGuard + wg-easy (Docker)
-# behind Caddy/Let's Encrypt on Debian 13. Uses core basic_auth with auto-fallback, disables Caddy admin,
+# behind Caddy/Let's Encrypt on Debian 13. Includes: core basic_auth with auto-fallback, disables Caddy admin,
 # purges autosave JSONs, validates adapted config for rogue "authentication", adds UFW, unattended-upgrades, fail2ban,
-# HTTP→HTTPS redirect, TUI prompts, autostart, progress bar, logging — and **normalizes WG_DEFAULT_ADDRESS** to avoid /24/24.
+# HTTP→HTTPS redirect, TUI prompts, autostart (systemd), progress bar (percent), logging. Normalizes
+# WG_DEFAULT_ADDRESS to avoid /mask/ mask issues and ensures wg-easy listens on 127.0.0.1:${WG_EASY_PORT}.
 #
 # Copyright (C) 2025 LINUXexpert.org
 #
@@ -109,18 +110,11 @@ apt-get install $APTQ ca-certificates gnupg apt-transport-https curl iproute2 dn
 # Produces: WG_DEFAULT_ADDRESS="10.8.0.x" and WG_DEFAULT_ADDRESS_RANGE=24 (default if not specified)
 norm_cidr() {
   local in="$1" base="" range="" o1 o2 o3 o4
-  # extract range if present
   if [[ "$in" == */* ]]; then range="${in##*/}"; in="${in%%/*}"; fi
-  # if dotted quad, keep first 3 octets, replace last with "x"
   IFS=. read -r o1 o2 o3 o4 <<<"$in"
-  if [[ -z "$o1" || -z "$o2" || -z "$o3" ]]; then
-    echo "ERR"
-    return
-  fi
+  if [[ -z "$o1" || -z "$o2" || -z "$o3" ]]; then echo "ERR"; return; fi
   base="${o1}.${o2}.${o3}.x"
-  # default range 24 if empty
   [[ -z "$range" ]] && range="24"
-  # sanity: numeric 0..32
   [[ "$range" =~ ^[0-9]+$ && "$range" -ge 0 && "$range" -le 32 ]] || range="24"
   printf "%s;%s" "$base" "$range"
 }
@@ -140,7 +134,6 @@ tui_or_cli_prompts() {
     WG_HOST=$(wt_input "Public Hostname/IP" "Hostname or IP clients will reach:" "$WG_DOMAIN") || exit 1
     WG_PORT=$(wt_input "WireGuard UDP Port" "UDP port for WireGuard:" "51820") || exit 1
     WG_EASY_PORT=$(wt_input "wg-easy UI Port (container & host)" "Local-only UI port:" "51821") || exit 1
-    # subnet prompt now accepts 10.8.0.x or 10.8.0.0/24; we normalize to avoid /24/24
     RAW_SUBNET=$(wt_input "Tunnel Subnet" "Example: 10.8.0.x  (or 10.8.0.0/24)" "10.8.0.x") || exit 1
     WG_DEFAULT_DNS=$(wt_input "Client DNS" "Comma-separated DNS for clients:" "1.1.1.1,9.9.9.9") || exit 1
     if wt_yesno "IPv6 Forwarding" "Enable IPv6 forwarding for WireGuard?"; then ENABLE_IPV6="Y"; else ENABLE_IPV6="N"; fi
@@ -203,9 +196,9 @@ tui_or_cli_prompts() {
 printf -- "\n%s=== WireGuard + wg-easy (Docker) behind Caddy/Let's Encrypt (Debian 13) ===%s\n\n" "$BLD" "$CLR" >&3
 tui_or_cli_prompts
 
-# Normalize/derive WG_DEFAULT_ADDRESS + RANGE (prevents /24/24 error)
-SUB=$(norm_cidr "$RAW_SUBNET") || SUB="ERR"
-if [[ "$SUB" == "ERR" ]]; then err "Invalid subnet '$RAW_SUBNET'"; exit 1; fi
+# Normalize/derive WG_DEFAULT_ADDRESS + RANGE (prevents /mask/ mask error)
+SUB=$(norm_cidr "${RAW_SUBNET:-10.8.0.x}") || SUB="ERR"
+if [[ "$SUB" == "ERR" ]]; then err "Invalid subnet '${RAW_SUBNET:-}''"; exit 1; fi
 WG_DEFAULT_ADDRESS="${SUB%%;*}"
 WG_DEFAULT_ADDRESS_RANGE="${SUB##*;}"
 
@@ -284,7 +277,7 @@ run_step "Update packages & base tools" "apt-get update -qq; apt-get install $AP
 # 2) sysctl forwarding
 run_step "Configure IP forwarding" "cat > /etc/sysctl.d/99-wireguard-forwarding.conf <<EOF
 net.ipv4.ip_forward=1
-$([[ "$ENABLE_IPV6" =~ ^[Yy]$ ]] && echo 'net.ipv6.conf.all.forwarding=1')
+$([[ "${ENABLE_IPV6:-N}" =~ ^[Yy]$ ]] && echo 'net.ipv6.conf.all.forwarding=1')
 EOF
 sysctl --system >/dev/null"
 
@@ -331,7 +324,7 @@ systemctl daemon-reload
 for f in ${AUTOSAVES[*]}; do rm -f \"\$f\" 2>/dev/null || true; done
 "
 
-# 6) wg-easy files (hash admin, **force PORT mapping**, **write normalized subnet**)
+# 6) wg-easy files (hash admin, force PORT mapping, write normalized subnet)
 WGEASY_PASS_HASH=$(htpasswd -nbB user "$WGEASY_ADMIN_PASS" | cut -d: -f2)
 run_step "Create wg-easy deployment files" "
 mkdir -p '$CONFIG_DIR'
@@ -372,15 +365,14 @@ services:
 EOF
 "
 
-# 7) Caddyfile (admin off), sanitize, validate; fallback if plugin authentication appears
+# 7) Caddyfile (admin off), sanitize, validate; fallback if plugin 'authentication' appears
 AUTH_BLOCK_CORE=""
 AUTH_BLOCK_LEGACY=""
-if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
+if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "${BASIC_HASH:-}" =~ ^\$2[aby]\$.+ ]]; then
   AUTH_BLOCK_CORE=$'  basic_auth /* {\n    '"${BASIC_USER:-admin}"' '"$BASIC_HASH"$'\n  }\n'
   AUTH_BLOCK_LEGACY=$'  basicauth /* {\n    '"${BASIC_USER:-admin}"' '"$BASIC_HASH"$'\n  }\n'
 fi
 
-# Optional IP allowlist body
 if [[ -n "${IP_ALLOW_CIDR:-}" ]]; then
   SITE_BODY=$(cat <<EOS
   log {
@@ -478,25 +470,28 @@ if [[ "${ENABLE_UFW:-Y}" =~ ^[Yy]$ ]]; then
   "
 fi
 
-# 9) unattended-upgrades
+# 9) unattended-upgrades (patched to keep ${distro_codename} literal)
 if [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]]; then
   run_step "Enable unattended security updates" "
   apt-get install $APTQ unattended-upgrades apt-listchanges
   dpkg-reconfigure --priority=low unattended-upgrades >/dev/null || true
   cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'CFG'
 Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
-        "origin=Debian,codename=${distro_codename},label=Debian";
+        \"origin=Debian,codename=\${distro_codename},label=Debian-Security\";
+        \"origin=Debian,codename=\${distro_codename},label=Debian\";
 };
-Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "03:30";
+Unattended-Upgrade::Automatic-Reboot \"true\";
+Unattended-Upgrade::Automatic-Reboot-Time \"03:30\";
 CFG
-  [[ -n "$UPD_MAIL" ]] && { sed -i "1 i Unattended-Upgrade::Mail \"$UPD_MAIL\";" /etc/apt/apt.conf.d/50unattended-upgrades; sed -i "1 i Unattended-Upgrade::MailReport \"on-change\";" /etc/apt/apt.conf.d/50unattended-upgrades; }
+  if [[ -n \"$UPD_MAIL\" ]]; then
+    sed -i \"1 i Unattended-Upgrade::Mail \\\"$UPD_MAIL\\\";\" /etc/apt/apt.conf.d/50unattended-upgrades
+    sed -i \"1 i Unattended-Upgrade::MailReport \\\"on-change\\\";\" /etc/apt/apt.conf.d/50unattended-upgrades
+  fi
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<'CFG'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Update-Package-Lists \"1\";
+APT::Periodic::Download-Upgradeable-Packages \"1\";
+APT::Periodic::Unattended-Upgrade \"1\";
+APT::Periodic::AutocleanInterval \"7\";
 CFG
   systemctl enable --now unattended-upgrades >/dev/null
   systemctl restart unattended-upgrades >/dev/null || true
@@ -569,7 +564,7 @@ systemctl enable --now wg-easy-compose.service
 "
 fi
 
-# 13) Reload Caddy
+# 13) Reload Caddy (activate config; purge autosaves again)
 run_step "Reload Caddy (activate config; purge AUTOSAVEs again)" "
 for f in ${AUTOSAVES[*]}; do rm -f \"\$f\" 2>/dev/null || true; done
 caddy validate --config '$CADDYFILE'
