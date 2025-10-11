@@ -3,7 +3,7 @@
 # behind Caddy/Let's Encrypt on Debian 13. Includes unattended-upgrades, fail2ban, UFW,
 # explicit HTTP→HTTPS redirect, pre/post-flight checks, percentage progress bar, robust BasicAuth pre-flight,
 # optional whiptail TUI, autostart for all services + compose stack, a full logfile, Caddy auth/import purge,
-# and a systemd drop-in override to force using /etc/caddy/Caddyfile.
+# systemd drop-in override to force using /etc/caddy/Caddyfile, Caddy admin off, and autosave quarantine.
 #
 # Copyright (C) 2025 LINUXexpert.org
 #
@@ -228,18 +228,21 @@ CONFIG_DIR="$APP_DIR/config"
 CADDYFILE="/etc/caddy/Caddyfile"
 ACCESS_LOG_DIR="/var/log/caddy"
 COMPOSE_UNIT="/etc/systemd/system/wg-easy-compose.service"
+DROPIN_DIR="/etc/systemd/system/caddy.service.d"
+AUTOSAVE="/var/lib/caddy/.config/caddy/autosave.json"
 
 # ===== Optional purge of conflicting Caddy configs =====
 if [[ "${PURGE_CADDY:-Y}" =~ ^[Yy]$ ]]; then
-  run_step "Purge conflicting Caddy auth/imports (backup & scrub)" "
+  run_step "Purge conflicting Caddy auth/imports/JSON/autosave" "
   TS=\$(date +%Y%m%d-%H%M%S)
   mkdir -p /etc/caddy/backup-\$TS
   cp -a /etc/caddy/* /etc/caddy/backup-\$TS/ 2>/dev/null || true
   find /etc/caddy -maxdepth 1 -type f ! -name 'Caddyfile' -print -exec mv {} /etc/caddy/backup-\$TS/ \\; || true
-  for d in conf.d sites-enabled snippets d vhosts; do
-    if [ -e \"/etc/caddy/\$d\" ]; then mv \"/etc/caddy/\$d\" \"/etc/caddy/backup-\$TS/\$d\"; fi
+  for d in conf.d sites-enabled snippets vhosts d; do
+    [ -e \"/etc/caddy/\$d\" ] && mv \"/etc/caddy/\$d\" \"/etc/caddy/backup-\$TS/\$d\"
   done
   [ -f /etc/caddy/caddy.json ] && mv /etc/caddy/caddy.json \"/etc/caddy/backup-\$TS/caddy.json\"
+  [ -f '$AUTOSAVE' ] && mv '$AUTOSAVE' \"/etc/caddy/backup-\$TS/autosave.json\"
   if [[ -s '$CADDYFILE' ]]; then
     awk 'BEGIN{skip=0}
       /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
@@ -285,8 +288,8 @@ run_step "Install & enable Docker Engine" "command -v docker >/dev/null || { cur
 # 4) docker compose plugin
 run_step "Install docker compose plugin" "docker compose version >/dev/null 2>&1 || apt-get install $APTQ docker-compose-plugin"
 
-# 5) Caddy (enable autostart) + optional drop-in override
-run_step "Install & enable Caddy (+unit drop-in)" "
+# 5) Caddy (enable autostart) + optional drop-in override; ensure autosave gone
+run_step "Install & enable Caddy (+unit drop-in; admin off later; autosave purge)" "
 if ! command -v caddy >/dev/null; then
   apt-get install $APTQ debian-keyring debian-archive-keyring
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -296,9 +299,10 @@ fi
 systemctl enable --now caddy
 mkdir -p $ACCESS_LOG_DIR
 chown -R caddy:caddy $ACCESS_LOG_DIR || true
+rm -f '$AUTOSAVE' 2>/dev/null || true
 if [[ '${FORCE_CADDY_DROPIN:-Y}' =~ ^[Yy]$ ]]; then
-  mkdir -p /etc/systemd/system/caddy.service.d
-  cat > /etc/systemd/system/caddy.service.d/override.conf <<OVR
+  mkdir -p '$DROPIN_DIR'
+  cat > '$DROPIN_DIR/override.conf' <<OVR
 [Service]
 ExecStart=
 ExecStart=/usr/bin/caddy run --environ --config $CADDYFILE
@@ -343,7 +347,7 @@ services:
 EOF
 "
 
-# 7) Caddyfile (write minimal, then inject basicauth if enabled), sanitize, validate
+# 7) Caddyfile (write with admin off), sanitize, validate
 CADDY_BASICAUTH_LINE=""
 if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ && "$BASIC_HASH" =~ ^\$2[aby]\$.+ ]]; then
   CADDY_BASICAUTH_LINE=$'  basicauth /* {\n    '"$BASIC_USER"' '"$BASIC_HASH"$'\n  }\n'
@@ -374,9 +378,10 @@ tls {
 EOS
 )
 
-run_step "Write Caddyfile with HTTP→HTTPS redirect & ACME; sanitize & validate" "
+run_step "Write Caddyfile (admin off) with HTTP→HTTPS redirect & ACME; sanitize & validate" "
 cat > '$CADDYFILE' <<EOF
 {
+  admin off
   email $LE_EMAIL
   acme_ca $ACME_CA
 }
@@ -389,7 +394,7 @@ $WG_DOMAIN {
   log {
     output file $ACCESS_LOG_DIR/access.log
     format json
-}
+  }
 $SITE_BODY
 }
 EOF
@@ -528,8 +533,12 @@ systemctl enable --now wg-easy-compose.service
 "
 fi
 
-# 13) Reload Caddy (after final validation)
-run_step "Reload Caddy (activate config)" "caddy validate --config '$CADDYFILE' && (systemctl reload caddy || systemctl restart caddy)"
+# 13) Reload Caddy (after final validation; autosave purge again)
+run_step "Reload Caddy (activate config)" "
+rm -f '$AUTOSAVE' 2>/dev/null || true
+caddy validate --config '$CADDYFILE'
+systemctl reload caddy || systemctl restart caddy
+"
 
 # ===== Post-Install Sanity Checks =====
 printf "\n\n%s=== Running sanity checks ===%s\n" "$BLD" "$CLR" >&3
