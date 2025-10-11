@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-wg-easy.sh - Quiet, logged, interactive (TUI-capable) installer for WireGuard + wg-easy (Docker)
 # behind Caddy/Let's Encrypt on Debian 13. Includes unattended-upgrades, fail2ban, UFW,
-# explicit HTTP->HTTPS redirect, full pre/post-flight checks, percentage progress bar,
+# explicit HTTP→HTTPS redirect, full pre/post-flight checks, percentage progress bar,
 # optional whiptail TUI, autostart for all services + compose stack, and a full logfile.
 #
 # Copyright (C) 2025 LINUXexpert.org
@@ -61,26 +61,21 @@ tui_or_cli_prompts() {
     while [[ -z "$WG_DOMAIN" ]]; do WG_DOMAIN=$(wt_input "Required" "Domain cannot be empty:" "") || exit 1; done
     LE_EMAIL=$(wt_input "Let's Encrypt Email" "Email for ACME/Notices:" "") || exit 1
     while [[ -z "$LE_EMAIL" ]]; do LE_EMAIL=$(wt_input "Required" "Email cannot be empty:" "") || exit 1; done
-
     if wt_yesno "ACME Mode" "Use Let's Encrypt STAGING (test-only)?" ; then ACME_CA="https://acme-staging-v02.api.letsencrypt.org/directory"; else ACME_CA="https://acme-v02.api.letsencrypt.org/directory"; fi
-
     WG_HOST=$(wt_input "Public Hostname/IP" "Hostname or IP clients will reach:" "$WG_DOMAIN") || exit 1
     WG_PORT=$(wt_input "WireGuard UDP Port" "UDP port for WireGuard:" "51820") || exit 1
     WG_EASY_PORT=$(wt_input "wg-easy UI Port" "Local-only UI port:" "51821") || exit 1
     WG_DEFAULT_ADDRESS=$(wt_input "Tunnel Subnet" "IPv4 CIDR for tunnel:" "10.8.0.0/24") || exit 1
     WG_DEFAULT_DNS=$(wt_input "Client DNS" "Comma-separated DNS for clients:" "1.1.1.1,9.9.9.9") || exit 1
     if wt_yesno "IPv6 Forwarding" "Enable IPv6 forwarding for WireGuard?" ; then ENABLE_IPV6="Y"; else ENABLE_IPV6="N"; fi
-
     if wt_yesno "Basic Auth" "Protect UI with Basic Auth (Caddy)?" ; then
       ENABLE_BASICAUTH="Y"
       BASIC_USER=$(wt_input "Basic Auth User" "Username for Basic Auth:" "admin") || exit 1
       BASIC_PASS=$(wt_password "Basic Auth Password" "Enter Basic Auth password:") || exit 1
       while [[ -z "$BASIC_PASS" ]]; do BASIC_PASS=$(wt_password "Required" "Password cannot be empty:") || exit 1; done
     else ENABLE_BASICAUTH="N"; fi
-
     WGEASY_ADMIN_PASS=$(wt_password "wg-easy Admin Password" "Password for wg-easy UI:") || exit 1
     while [[ -z "$WGEASY_ADMIN_PASS" ]]; do WGEASY_ADMIN_PASS=$(wt_password "Required" "Password cannot be empty:") || exit 1; done
-
     IP_ALLOW_CIDR=$(wt_input "UI Allowlist (optional)" "CIDR allowed to UI (blank = none):" "") || exit 1
     if wt_yesno "Firewall" "Install & enable UFW (22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp)?" ; then ENABLE_UFW="Y"; else ENABLE_UFW="N"; fi
     if wt_yesno "Unattended Upgrades" "Enable unattended security updates?" ; then
@@ -112,7 +107,7 @@ tui_or_cli_prompts() {
     if [[ "$ENABLE_BASICAUTH" =~ ^[Yy]$ ]]; then ask "Basic Auth username:" BASIC_USER "admin"; ask_secret "Basic Auth password:" BASIC_PASS; fi
     ask_secret "wg-easy admin password:" WGEASY_ADMIN_PASS
     ask "Restrict UI to IP/CIDR (blank = none):" IP_ALLOW_CIDR ""
-    ask "Install & enable UFW (22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp)? [Y/n]:" ENABLE_UFW "Y"
+    ask "Install & enable UFK (22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp)? [Y/n]:" ENABLE_UFW "Y"
     ask "Enable unattended security updates? [Y/n]:" ENABLE_AUTOUPD "Y"
     UPD_MAIL=""; if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then ask "Email notifications for upgrades? (blank = none):" UPD_MAIL "$LE_EMAIL"; fi
     ask "Install & configure fail2ban (sshd + Caddy)? [Y/n]:" ENABLE_F2B "Y"
@@ -130,15 +125,18 @@ tui_or_cli_prompts() {
 STEP_NUM=0; STEP_MAX=0; BAR_WIDTH=42
 repeat_char() { local n=$1 c="$2"; [[ $n -le 0 ]] && return 0; printf "%0.s${c}" $(seq 1 "$n"); }
 draw_bar()   { local pct=$1; (( pct<0 )) && pct=0; (( pct>100 )) && pct=100; local filled=$(( pct * BAR_WIDTH / 100 )); printf "\r[%-*s] %3d%%" "$BAR_WIDTH" "$(repeat_char "$filled" "#")" "$pct" >&3; }
-advance_bar(){ STEP_NUM=$((STEP_NUM+1)); local pct=$(( STEP_NUM * 100 / STEP_MAX )); draw_bar "$pct"; }
+advance_bar(){
+  STEP_NUM=$((STEP_NUM+1))
+  (( STEP_MAX < 1 )) && STEP_MAX=1
+  local pct=$(( STEP_NUM * 100 / STEP_MAX ))
+  draw_bar "$pct"
+}
 
+# ===== Step runner (safe printf) =====
 run_step() {
   local title="$1"; shift
-  # Announce on the quiet console (FD 3)
   printf "%s\n" "" >&3
   printf "%s\n" "Step $((STEP_NUM+1))/$STEP_MAX: $title" >&3
-
-  # Write detailed log to the logfile via stderr (>&2)
   {
     printf "%s\n" "--- [$(date -Is)] $title ---" >&2
     bash -o pipefail -c "$@" >&2
@@ -146,7 +144,6 @@ run_step() {
   }
   advance_bar
 }
-
 
 # ===== Trap & Logging =====
 cleanup_on_error(){ printf "\n" >&3; err "An unexpected error occurred. See the log: $LOGFILE"; }
@@ -212,8 +209,34 @@ if ss -plnu | grep -qE "[:.]${WG_PORT}(\s|$)"; then
   else ask "Continue anyway? [y/N]:" cont_w "N"; [[ "$cont_w" =~ ^[Yy]$ ]] || { err "Please free UDP ${WG_PORT} and re-run."; exit 1; }; fi
 fi
 
-# ===== Plan steps =====
-STEP_MAX=$(( 8 /*base*/ + 2 /*launch+reload*/ + ( [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] && echo 1 || echo 0 ) + ( [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]] && echo 1 || echo 0 ) + ( [[ "$ENABLE_F2B" =~ ^[Yy]$ ]] && echo 1 || echo 0 ) + ( [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]] && echo 1 || echo 0 ) ))
+# ===== STEP_MAX calculation (procedural; no division by zero) =====
+STEP_MAX=0
+# 1 Update/base tools
+STEP_MAX=$((STEP_MAX+1))
+# 2 sysctl forwarding
+STEP_MAX=$((STEP_MAX+1))
+# 3 Docker Engine
+STEP_MAX=$((STEP_MAX+1))
+# 4 docker compose plugin
+STEP_MAX=$((STEP_MAX+1))
+# 5 Caddy
+STEP_MAX=$((STEP_MAX+1))
+# 6 wg-easy deployment files
+STEP_MAX=$((STEP_MAX+1))
+# 7 Caddyfile
+STEP_MAX=$((STEP_MAX+1))
+# optional: UFW
+if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+# optional: unattended-upgrades
+if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+# optional: fail2ban
+if [[ "$ENABLE_F2B" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+# 11 launch wg-easy
+STEP_MAX=$((STEP_MAX+1))
+# optional: compose autostart unit
+if [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
+# 12 reload caddy
+STEP_MAX=$((STEP_MAX+1))
 
 APP_DIR="/opt/wg-easy"
 CONFIG_DIR="$APP_DIR/config"
@@ -288,17 +311,68 @@ services:
 EOF
 "
 
-# 7) Caddyfile (HTTP→HTTPS redirect + HTTPS site)
+# 7) Caddyfile (no empty blocks; safe for allowlist/basicauth combos)
+# Build optional snippets
 CADDY_BASICAUTH_LINE=""
 if [[ "$ENABLE_BASICAUTH" =~ ^[Yy]$ ]]; then
   BASIC_HASH=$( (caddy hash-password --plaintext "$BASIC_PASS" 2>/dev/null) || (htpasswd -nbB x "$BASIC_PASS" | cut -d: -f2) )
-  CADDY_BASICAUTH_LINE=$'\n    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }'
+  CADDY_BASICAUTH_LINE=$'    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }\n'
 fi
-CADDY_IP_ALLOW_MATCHER=""; CADDY_IP_ALLOW_HANDLE=""
+
 if [[ -n "$IP_ALLOW_CIDR" ]]; then
-  CADDY_IP_ALLOW_MATCHER=$'\n  @allow_ips {\n    remote_ip '"$IP_ALLOW_CIDR"$'\n  }'
-  CADDY_IP_ALLOW_HANDLE=$'\n  handle {\n    respond "Forbidden" 403\n  }\n  handle @allow_ips {\n    reverse_proxy 127.0.0.1:'"$WG_EASY_PORT"$'\n  }'
+  SITE_BODY=$(cat <<EOS
+  log {
+    output file $ACCESS_LOG_DIR/access.log
+    format json
+  }
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "no-referrer"
+    X-XSS-Protection "1; mode=block"
+  }
+
+  @allow_ips {
+    remote_ip $IP_ALLOW_CIDR
+  }
+
+  handle {
+    respond "Forbidden" 403
+  }
+
+  handle @allow_ips {
+$CADDY_BASICAUTH_LINE    reverse_proxy 127.0.0.1:$WG_EASY_PORT
+  }
+
+  tls {
+    protocols tls1.2 tls1.3
+  }
+EOS
+)
+else
+  SITE_BODY=$(cat <<EOS
+  log {
+    output file $ACCESS_LOG_DIR/access.log
+    format json
+  }
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "no-referrer"
+    X-XSS-Protection "1; mode=block"
+  }
+
+$CADDY_BASICAUTH_LINE  reverse_proxy 127.0.0.1:$WG_EASY_PORT
+
+  tls {
+    protocols tls1.2 tls1.3
+  }
+EOS
+)
 fi
+
 run_step "Write Caddyfile with HTTP→HTTPS redirect & ACME" "
 cat > '$CADDYFILE' <<EOF
 {
@@ -312,25 +386,7 @@ http://$WG_DOMAIN {
 
 $WG_DOMAIN {
   encode gzip
-  log {
-    output file $ACCESS_LOG_DIR/access.log
-    format json
-  }
-  header {
-    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-    X-Content-Type-Options "nosniff"
-    X-Frame-Options "SAMEORIGIN"
-    Referrer-Policy "no-referrer"
-    X-XSS-Protection "1; mode=block"
-  }
-  $CADDY_IP_ALLOW_MATCHER
-  @ui path /*
-  handle @ui {
-    $CADDY_BASICAUTH_LINE
-    $( [[ -z "$IP_ALLOW_CIDR" ]] && echo "reverse_proxy 127.0.0.1:$WG_EASY_PORT" )
-  }
-  $( [[ -n "$CADDY_IP_ALLOW_HANDLE" ]] && echo "$CADDY_IP_ALLOW_HANDLE" )
-  tls { protocols tls1.2 tls1.3 }
+$SITE_BODY
 }
 EOF
 caddy validate --config '$CADDYFILE' >/dev/null
@@ -458,7 +514,7 @@ systemctl enable --now wg-easy-compose.service
 fi
 
 # 13) Reload Caddy
-run_step "Reload Caddy (activate config)" "systemctl reload caddy || systemctl restart caddy"
+run_step "Reload Caddy (activate config)" "caddy validate --config '$CADDYFILE' && (systemctl reload caddy || systemctl restart caddy)"
 
 # ===== Post-Install Sanity Checks =====
 printf "\n\n%s=== Running sanity checks ===%s\n" "$BLD" "$CLR" >&3
