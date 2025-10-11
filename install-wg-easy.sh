@@ -107,7 +107,7 @@ tui_or_cli_prompts() {
     if [[ "$ENABLE_BASICAUTH" =~ ^[Yy]$ ]]; then ask "Basic Auth username:" BASIC_USER "admin"; ask_secret "Basic Auth password:" BASIC_PASS; fi
     ask_secret "wg-easy admin password:" WGEASY_ADMIN_PASS
     ask "Restrict UI to IP/CIDR (blank = none):" IP_ALLOW_CIDR ""
-    ask "Install & enable UFK (22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp)? [Y/n]:" ENABLE_UFW "Y"
+    ask "Install & enable UFW (22/tcp, 80/tcp, 443/tcp, ${WG_PORT}/udp)? [Y/n]:" ENABLE_UFW "Y"
     ask "Enable unattended security updates? [Y/n]:" ENABLE_AUTOUPD "Y"
     UPD_MAIL=""; if [[ "$ENABLE_AUTOUPD" =~ ^[Yy]$ ]]; then ask "Email notifications for upgrades? (blank = none):" UPD_MAIL "$LE_EMAIL"; fi
     ask "Install & configure fail2ban (sshd + Caddy)? [Y/n]:" ENABLE_F2B "Y"
@@ -315,7 +315,12 @@ EOF
 # Build optional snippets
 CADDY_BASICAUTH_LINE=""
 if [[ "$ENABLE_BASICAUTH" =~ ^[Yy]$ ]]; then
-  BASIC_HASH=$( (caddy hash-password --plaintext "$BASIC_PASS" 2>/dev/null) || (htpasswd -nbB x "$BASIC_PASS" | cut -d: -f2) )
+  # Prefer caddy's hasher; if not present, fallback to htpasswd and normalize $2y$ -> $2a$
+  if command -v caddy >/dev/null 2>&1; then
+    BASIC_HASH="$(caddy hash-password --plaintext "$BASIC_PASS" 2>/dev/null | tr -d '\r\n')"
+  else
+    BASIC_HASH="$(htpasswd -nbB x "$BASIC_PASS" | cut -d: -f2 | sed 's/^\$2y\$/\$2a\$/')"
+  fi
   CADDY_BASICAUTH_LINE=$'    basicauth /* {\n      '"$BASIC_USER"' '"$BASIC_HASH"$'\n    }\n'
 fi
 
@@ -389,7 +394,7 @@ $WG_DOMAIN {
 $SITE_BODY
 }
 EOF
-caddy validate --config '$CADDYFILE' >/dev/null
+caddy validate --config '$CADDYFILE'
 "
 
 # 8) UFW (enable autostart)
