@@ -2,7 +2,8 @@
 # install-wg-easy.sh - Quiet, logged, interactive (TUI-capable) installer for WireGuard + wg-easy (Docker)
 # behind Caddy/Let's Encrypt on Debian 13. Includes unattended-upgrades, fail2ban, UFW,
 # explicit HTTP→HTTPS redirect, pre/post-flight checks, percentage progress bar, robust BasicAuth pre-flight,
-# optional whiptail TUI, autostart for all services + compose stack, a full logfile, and Caddy auth/import purge.
+# optional whiptail TUI, autostart for all services + compose stack, a full logfile, Caddy auth/import purge,
+# and a systemd drop-in override to force using /etc/caddy/Caddyfile.
 #
 # Copyright (C) 2025 LINUXexpert.org
 #
@@ -93,12 +94,11 @@ info "Installer log: $LOGFILE"
 apt-get update -qq >/dev/null 2>&1 || true
 apt-get install $APTQ ca-certificates gnupg apt-transport-https curl iproute2 dnsutils jq apache2-utils openssl whiptail >/dev/null 2>&1 || true
 
-# ===== TUI choice =====
+# ===== TUI or CLI prompts =====
 if command -v whiptail >/dev/null 2>&1; then
   if whiptail --title "Interface" --yesno "Use TUI (whiptail) for prompts?" 9 60; then WT=1; else WT=0; fi
 fi
 
-# ===== Prompts =====
 tui_or_cli_prompts() {
   if (( WT )); then
     WG_DOMAIN=$(wt_input "wg-easy Domain" "Enter the domain for the wg-easy web UI:" "") || exit 1
@@ -136,6 +136,7 @@ tui_or_cli_prompts() {
     else ENABLE_F2B="N"; F2B_BANTIME="1h"; F2B_FINDTIME="10m"; F2B_MAXRETRY="5"; fi
     if wt_yesno "Autostart Compose" "Create a systemd unit to re-up wg-easy on boot?" ; then ENABLE_COMPOSE_UNIT="Y"; else ENABLE_COMPOSE_UNIT="N"; fi
     if wt_yesno "Caddy Purge" "Purge conflicting Caddy 'authentication' blocks and 'import' directives if detected? (Recommended)" ; then PURGE_CADDY="Y"; else PURGE_CADDY="N"; fi
+    if wt_yesno "Force Unit Caddyfile" "Force Caddy service to use /etc/caddy/Caddyfile (systemd drop-in)? (Recommended)" ; then FORCE_CADDY_DROPIN="Y"; else FORCE_CADDY_DROPIN="N"; fi
   else
     ask_req "Domain for the wg-easy web UI (e.g., vpn.example.com):" WG_DOMAIN
     ask_req "Email for Let's Encrypt / Caddy (TLS notices):" LE_EMAIL
@@ -164,6 +165,7 @@ tui_or_cli_prompts() {
     fi
     ask "Create a systemd unit to re-up wg-easy on boot? [Y/n]:" ENABLE_COMPOSE_UNIT "Y"
     ask "Purge conflicting Caddy 'authentication' blocks and 'import' directives if detected? [Y/n]:" PURGE_CADDY "Y"
+    ask "Force Caddy service to use /etc/caddy/Caddyfile (systemd drop-in)? [Y/n]:" FORCE_CADDY_DROPIN "Y"
   fi
 }
 printf "\n%s=== WireGuard + wg-easy (Docker) behind Caddy/Let's Encrypt (Debian 13) ===%s\n\n" "$BLD" "$CLR" >&3
@@ -221,17 +223,20 @@ if [[ "${ENABLE_BASICAUTH:-N}" =~ ^[Yy]$ ]]; then
   fi
 fi
 
-# ===== Optional purge of conflicting Caddy configs =====
+# ===== Vars / Paths =====
+APP_DIR="/opt/wg-easy"
+CONFIG_DIR="$APP_DIR/config"
 CADDYFILE="/etc/caddy/Caddyfile"
 ACCESS_LOG_DIR="/var/log/caddy"
+COMPOSE_UNIT="/etc/systemd/system/wg-easy-compose.service"
+
+# ===== Optional purge of conflicting Caddy configs =====
 if [[ "${PURGE_CADDY:-Y}" =~ ^[Yy]$ ]]; then
   run_step "Purge conflicting Caddy auth/imports (backup & scrub)" "
   TS=\$(date +%Y%m%d-%H%M%S)
   mkdir -p /etc/caddy/backup-\$TS
   cp -a /etc/caddy/* /etc/caddy/backup-\$TS/ 2>/dev/null || true
-  # Remove any *.conf or extra files that might be imported by older configs
   find /etc/caddy -maxdepth 1 -type f ! -name 'Caddyfile' -print -exec mv {} /etc/caddy/backup-\$TS/ \\; || true
-  # If an old Caddyfile exists, strip 'import' lines and 'authentication { ... }' blocks into a cleaned copy
   if [[ -s '$CADDYFILE' ]]; then
     awk 'BEGIN{skip=0}
       /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
@@ -258,11 +263,7 @@ if [[ "${ENABLE_AUTOUPD:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 if [[ "${ENABLE_F2B:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
 STEP_MAX=$((STEP_MAX+1)) # 11 launch wg-easy
 if [[ "${ENABLE_COMPOSE_UNIT:-Y}" =~ ^[Yy]$ ]]; then STEP_MAX=$((STEP_MAX+1)); fi
-STEP_MAX=$((STEP_MAX+1)) # 13 reload caddy
-
-APP_DIR="/opt/wg-easy"
-CONFIG_DIR="$APP_DIR/config"
-COMPOSE_UNIT="/etc/systemd/system/wg-easy-compose.service"
+STEP_MAX=$((STEP_MAX+1)) # 13 caddy reload
 printf "\n" >&3; draw_bar 0
 
 # 1) apt update & base tools
@@ -281,8 +282,8 @@ run_step "Install & enable Docker Engine" "command -v docker >/dev/null || { cur
 # 4) docker compose plugin
 run_step "Install docker compose plugin" "docker compose version >/dev/null 2>&1 || apt-get install $APTQ docker-compose-plugin"
 
-# 5) Caddy (enable autostart)
-run_step "Install & enable Caddy" "
+# 5) Caddy (enable autostart) + optional drop-in override
+run_step "Install & enable Caddy (+optional unit drop-in)" "
 if ! command -v caddy >/dev/null; then
   apt-get install $APTQ debian-keyring debian-archive-keyring
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -292,9 +293,18 @@ fi
 systemctl enable --now caddy
 mkdir -p $ACCESS_LOG_DIR
 chown -R caddy:caddy $ACCESS_LOG_DIR || true
+if [[ '${FORCE_CADDY_DROPIN:-Y}' =~ ^[Yy]$ ]]; then
+  mkdir -p /etc/systemd/system/caddy.service.d
+  cat > /etc/systemd/system/caddy.service.d/override.conf <<OVR
+[Service]
+ExecStart=
+ExecStart=/usr/bin/caddy run --environ --config $CADDYFILE
+OVR
+  systemctl daemon-reload
+fi
 "
 
-# 6) wg-easy deployment files
+# 6) wg-easy deployment files (bcrypt for wg-easy admin password)
 WGEASY_PASS_HASH=$(htpasswd -nbB user "$WGEASY_ADMIN_PASS" | cut -d: -f2)
 run_step "Create wg-easy deployment files" "
 mkdir -p '$CONFIG_DIR'
@@ -410,15 +420,12 @@ EOF
 
 # Sanitize any lingering auth/imports, validate & adapt
 run_step "Sanitize Caddyfile & validate" "
-# Strip imports and authentication blocks if any slipped in
 awk 'BEGIN{skip=0}
   /^[[:space:]]*authentication[[:space:]]*\\{/ {skip=1; depth=1; next}
   skip==1 { if (\$0 ~ /\\{/) depth++; if (\$0 ~ /\\}/){depth--; if (depth==0){skip=0; next}}; next }
   /^[[:space:]]*import[[:space:]]+/ {next}
   {print}
 ' '$CADDYFILE' > /etc/caddy/Caddyfile.tmp && mv -f /etc/caddy/Caddyfile.tmp '$CADDYFILE'
-
-# Validate & check adapted JSON for authentication handlers
 caddy validate --config '$CADDYFILE'
 caddy adapt    --config '$CADDYFILE' --pretty > /tmp/caddy-adapt.json
 grep -q '\"handler\"\\s*:\\s*\"authentication\"' /tmp/caddy-adapt.json && { echo 'Authentication handler still present after sanitize.' >&2; exit 1; }
