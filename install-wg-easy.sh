@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # install-wg-easy.sh - Interactive (TUI-capable), quiet & logged installer for:
 #   WireGuard + wg-easy (Docker) behind Caddy (Let's Encrypt) on Debian 13+.
-# Includes: Basic-Auth (optional), sanitized Caddyfile, autosave purge, UFW,
-# unattended-upgrades, fail2ban, loopback-bound wg-easy UI, systemd autostart,
-# progress percentage bar, full log.
+# Includes: optional Basic-Auth via Caddy, sanitized Caddyfile (no plugin auth),
+# autosave purge, UFW, unattended-upgrades, fail2ban (sshd + Caddy JSON),
+# loopback-bound wg-easy UI, systemd autostart, percentage progress bar, full log.
 #
 # Copyright (C) 2025 LINUXexpert.org
 #
@@ -250,6 +250,11 @@ systemctl enable --now caddy
 mkdir -p $ACCESS_LOG_DIR /var/lib/caddy
 chown -R caddy:caddy $ACCESS_LOG_DIR /var/lib/caddy
 chmod 755 /etc/caddy
+# Ensure access log exists and is readable by fail2ban
+touch $ACCESS_LOG_DIR/access.log
+chown caddy:caddy $ACCESS_LOG_DIR/access.log
+chmod 755 $ACCESS_LOG_DIR
+chmod 644 $ACCESS_LOG_DIR/access.log
 mkdir -p '$DROPIN_DIR'
 cat > '$DROPIN_DIR/override.conf' <<'OVR'
 [Service]
@@ -467,34 +472,47 @@ CFG
   "
 fi
 
-# 10) fail2ban
+# 10) fail2ban (HARDENED)
 if [[ "${ENABLE_F2B:-Y}" =~ ^[Yy]$ ]]; then
-  run_step "Install & enable fail2ban (sshd + Caddy)" "
+  run_step "Install & enable fail2ban (sshd + Caddy JSON)" "
   apt-get install $APTQ fail2ban
-  systemctl enable --now fail2ban
-  mkdir -p /etc/fail2ban/filter.d
+  systemctl enable --now fail2ban || true
+
+  # Ensure Caddy log exists & is readable
+  mkdir -p $ACCESS_LOG_DIR
+  touch $ACCESS_LOG_DIR/access.log
+  chown caddy:caddy $ACCESS_LOG_DIR $ACCESS_LOG_DIR/access.log
+  chmod 755 $ACCESS_LOG_DIR
+  chmod 644 $ACCESS_LOG_DIR/access.log
+
+  # Filter capturing client IP from Caddy JSON logs; bans on 401/403 bursts
   cat > /etc/fail2ban/filter.d/caddy-httperrors.conf <<'EOF'
 [Definition]
-failregex = ^\{.*\"status\":(401|403).*\}$
+failregex = ^\{.*\"request\":\{.*\"remote_ip\":\"<HOST>\".*\}.*\"status\":(?:401|403).*\}$
 ignoreregex =
 EOF
+
+  # Minimal, valid jail
   cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
-bantime = ${F2B_BANTIME:-1h}
+bantime  = ${F2B_BANTIME:-1h}
 findtime = ${F2B_FINDTIME:-10m}
 maxretry = ${F2B_MAXRETRY:-5}
 
 [sshd]
-enabled = true
-backend = systemd
+enabled  = true
+backend  = systemd
 
 [caddy-httperrors]
-enabled = true
-port    = http,https
-filter  = caddy-httperrors
-logpath = $ACCESS_LOG_DIR/access.log
-backend = auto
+enabled  = true
+port     = http,https
+filter   = caddy-httperrors
+logpath  = $ACCESS_LOG_DIR/access.log
+backend  = auto
 EOF
+
+  # Validate then restart
+  fail2ban-client -d >/dev/null
   systemctl restart fail2ban
   "
 fi
