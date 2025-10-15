@@ -76,8 +76,8 @@ The installer also creates:
 ```bash
 # 1) Clone and run (as root)
 cd /root
-git clone https://github.com/LINUXexpert-org/WG-Easy-Installer.git
-cd WG-Easy-Installer
+git clone https://github.com/LINUXexpert-org/WGX.git
+cd WGX
 sudo bash install-wg-easy.sh
 # 2) Choose TUI or CLI, answer prompts (domain, email, ports, etc.)
 # 3) Ensure DNS A/AAAA points to this server; free ports 80/443
