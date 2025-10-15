@@ -4,7 +4,7 @@
 
 WireGuard + wg-easy on Debian 13 (Docker, Caddy/Let’s Encrypt)
 
-Turn-key, **quiet + logged**, **interactive (with optional TUI)** installer for a hardened WireGuard VPN using **[wg-easy](https://github.com/wg-easy/wg-easy)** behind **Caddy** with automatic **Let’s Encrypt** TLS and **HTTP→HTTPS**. Includes **UFW**, **fail2ban**, **unattended-upgrades**, health checks, backup/restore, and an uninstall script. We are planning on new features, including replacing WGeasy with a new management backend supporting more robust security and multitenancy with integrated monitoring and more controls over system tuning.
+Turn-key, **quiet + logged**, **interactive (with optional TUI)** installer for a hardened WireGuard VPN using **[wg-easy](https://github.com/wg-easy/wg-easy)** behind **Caddy** with automatic **Let’s Encrypt** TLS and **HTTP→HTTPS**. Includes **UFW**, **fail2ban**, **unattended-upgrades**, health checks, backup/restore, and an uninstall script. We are planning on new features, including replacing wg-easy with a new management backend supporting more robust security and multitenancy with integrated monitoring and more controls over system tuning.
 
 > **Tested:** Debian 13 “Trixie” (Debian 12+ should work)
 > **Requires:** Root privileges
