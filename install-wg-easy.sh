@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install-wg-easy.sh - Interactive (TUI-capable), quiet & logged installer for:
-#   WireGuard + wg-easy (Docker) behind Caddy (Let's Encrypt) on Debian 13+.
+# WireGuard + wg-easy (Docker) behind Caddy (Let's Encrypt) on Debian 13+.
 # Includes: optional Basic-Auth via Caddy, sanitized Caddyfile (no plugin auth),
 # autosave purge, UFW, unattended-upgrades, fail2ban (sshd + Caddy JSON),
 # loopback-bound wg-easy UI, systemd autostart, percentage progress bar, full log.
